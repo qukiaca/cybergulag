@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pear2Pear</title>
+    <title>Pear2P - Media</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui; background: #f8f9fa; }
@@ -15,19 +15,29 @@
         #contactList li:hover { background: #e9ecef; }
         #contactList li.active { background: #d0ebff; font-weight: 500; }
         #myId { padding: 0.8rem; background: #e9ecef; font-size: 0.85rem; text-align: center; border-top: 1px solid #dee2e6; }
-        main { flex: 1; display: flex; flex-direction: column; padding: 1rem; }
-        .controls { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+        
+        main { flex: 1; display: flex; flex-direction: column; padding: 1rem; position: relative; }
+        #chat { flex: 1; border: 1px solid #dee2e6; border-radius: 6px; overflow-y: auto; padding: 0.8rem; margin-bottom: 1rem; background: #f8f9fa; display: flex; flex-direction: column; gap: 10px; }
+        
+        .controls { display: flex; gap: 0.5rem; align-items: center; }
         input { flex: 1; padding: 0.6rem; border: 1px solid #ced4da; border-radius: 6px; }
-        button { padding: 0.6rem 1rem; border: none; border-radius: 6px; cursor: pointer; background: #339af0; color: #fff; font-weight: 500; }
-        button:disabled { opacity: 0.4; cursor: not-allowed; background: #adb5bd; }
-        button.hangup { background: #fa5252; }
-        button.accept { background: #40c057; }
-        button.reject { background: #fa5252; }
-        #incomingCallPanel { display: none; background: #fff9db; border: 1px solid #ffe066; padding: 1rem; border-radius: 8px; margin-bottom: 1rem; text-align: center; }
-        #chat { flex: 1; border: 1px solid #dee2e6; border-radius: 6px; overflow-y: auto; padding: 0.8rem; margin-bottom: 1rem; background: #f8f9fa; }
-        .msg { margin: 0.4rem 0; padding: 0.5rem; background: #fff; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-        .sys { color: #868e96; font-style: italic; background: none; box-shadow: none; }
-        audio { width: 100%; margin-top: 0.5rem; display: none; }
+        
+        /* Кнопка записи */
+        #recordBtn { width: 45px; height: 45px; border-radius: 50%; border: none; background: #339af0; color: white; cursor: pointer; font-size: 1.2rem; display: flex; align-items: center; justify-content: center; user-select: none; transition: 0.2s; }
+        #recordBtn.recording { background: #fa5252; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+
+        /* Стили сообщений */
+        .msg { max-width: 80%; padding: 8px; border-radius: 8px; background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.1); align-self: flex-start; }
+        .msg.mine { align-self: flex-end; background: #d0ebff; }
+        .sys { align-self: center; color: #868e96; font-size: 0.8rem; }
+
+        /* Кружочки */
+        .video-circle { width: 200px; height: 200px; border-radius: 50%; object-fit: cover; border: 2px solid #339af0; background: #000; }
+        audio { height: 35px; }
+
+        /* Превью камеры при записи */
+        #videoPreview { position: absolute; bottom: 80px; right: 20px; width: 150px; height: 150px; border-radius: 50%; object-fit: cover; border: 3px solid #fa5252; display: none; background: #000; transform: scaleX(-1); }
     </style>
 </head>
 <body>
@@ -38,23 +48,12 @@
             <div id="myId">Загрузка...</div>
         </aside>
         <main>
-            <div id="incomingCallPanel">
-                📞 Входящий звонок от <strong id="callerName"></strong>
-                <div style="margin-top: 0.5rem;">
-                    <button id="acceptCallBtn" class="accept">✅ Принять</button>
-                    <button id="rejectCallBtn" class="reject">❌ Отклонить</button>
-                </div>
-            </div>
-            <div class="controls">
-                <input id="targetDisplay" placeholder="Выбери контакт слева" readonly />
-                <button id="callBtn" disabled>📞 Позвонить</button>
-                <button id="hangupBtn" class="hangup" disabled>📵 Завершить</button>
-            </div>
-            <audio id="audioRemote" autoplay playsinline></audio>
             <div id="chat"></div>
+            <video id="videoPreview" autoplay muted playsinline></video>
             <div class="controls">
-                <input id="msgInput" placeholder="Сообщение..." />
-                <button id="sendBtn" disabled>Отправить</button>
+                <input id="msgInput" placeholder="Сообщение..." autocomplete="off" />
+                <button id="recordBtn" title="Зажать 1.5с для записи, клик для смены мода">🎤</button>
+                <button id="sendBtn" style="display:none;">📤</button>
             </div>
         </main>
     </div>

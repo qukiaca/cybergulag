@@ -14,26 +14,21 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { retu
 type Peer struct {
 	ID   string
 	Conn *websocket.Conn
-	mu   sync.Mutex // Защита от конкурентных записей в одно соединение
+	mu   sync.Mutex
 }
 
 type Message struct {
-	Type    string `json:"type"`
-	From    string `json:"from"`
-	To      string `json:"to"`
-	Payload any    `json:"payload"`
+	Type      string `json:"type"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Payload   any    `json:"payload"`
+	MediaType string `json:"mediaType"` // Добавили это поле
 }
 
 var (
 	peers = make(map[string]*Peer)
 	mu    sync.RWMutex
 )
-
-func (p *Peer) WriteJSON(v any) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.Conn.WriteJSON(v)
-}
 
 func broadcastContacts() {
 	mu.RLock()
@@ -72,7 +67,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	peers[userID] = &Peer{ID: userID, Conn: conn}
 	mu.Unlock()
 	broadcastContacts()
-	log.Printf("🔌 Подключился: %s (всего: %d)", userID, len(peers))
+	log.Printf("👤 Вошел: %s", userID)
 
 	defer func() {
 		mu.Lock()
@@ -80,7 +75,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		mu.Unlock()
 		conn.Close()
 		broadcastContacts()
-		log.Printf("🔌 Отключился: %s", userID)
+		log.Printf("👤 Вышел: %s", userID)
 	}()
 
 	for {
@@ -90,7 +85,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var msg Message
-		if json.Unmarshal(msgBytes, &msg) != nil {
+		if err := json.Unmarshal(msgBytes, &msg); err != nil {
 			continue
 		}
 		msg.From = userID
@@ -100,7 +95,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		mu.RUnlock()
 
 		if ok {
-			target.WriteJSON(msg)
+			target.mu.Lock()
+			target.Conn.WriteJSON(msg)
+			target.mu.Unlock()
 		}
 	}
 }
@@ -108,7 +105,6 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/ws", handleWS)
 	http.Handle("/", http.FileServer(http.Dir(".")))
-	log.Println("🔒 HTTPS сервер: https://192.168.3.38:8080")
-	//log.Fatal(http.ListenAndServeTLS(":8080", "cert.pem", "key.pem", nil))
+	log.Println("🚀 Сервер запущен на http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
