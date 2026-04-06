@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Pear2P</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme"> <!-- По умолчанию темная -->
+
+    <div class="app-wrapper">
+        <div class="app-container">
+            <!-- Сайдбар -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <div class="logo">Pear2P</div>
+                    <button id="theme-toggle" class="icon-btn-circle"></button>
+                </div>
+                
+                <div class="user-card">
+                    <div class="avatar-placeholder" id="myAvatar"></div>
+                    <div class="user-info">
+                        <span>Ваш ID</span>
+                        <strong id="myId">Загрузка...</strong>
+                    </div>
+                </div>
+
+                <div class="contact-section">
+                    <div class="section-title">Активные контакты</div>
+                    <ul id="contactList" class="custom-scrollbar"></ul>
+                </div>
+            </aside>
+
+            <!-- Основная область -->
+            <main class="chat-area" id="chatArea">
+                <!-- Заглушка -->
+                <div id="welcome-screen" class="welcome-screen">
+                    <div class="welcome-content">
+                        <div class="welcome-icon">💬</div>
+                        <h2>Выберите чат</h2>
+                        <p>Начните безопасное p2p общение прямо сейчас</p>
+                    </div>
+                </div>
+
+                <!-- Чат -->
+                <div id="chat-view" class="chat-view hidden">
+                    <header class="chat-header">
+                        <button id="mobile-back" class="mobile-only-btn">←</button>
+                        <div class="active-user-info">
+                            <div class="status-dot"></div>
+                            <h2 id="activeContactId">Пользователь</h2>
+                        </div>
+                    </header>
+                    
+                    <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
+
+                    <video id="videoPreview" autoplay muted playsinline></video>
+
+                    <footer class="chat-input-container">
+                        <div class="input-wrapper">
+                            <input id="msgInput" type="text" placeholder="Напишите что-нибудь..." autocomplete="off">
+                            <div class="input-actions">
+                                <button id="recordBtn" class="action-btn">
+                                    <span id="mic-icon">🎤</span>
+                                    <span id="video-icon" class="hidden">📷</span>
+                                </button>
+                                <button id="sendBtn" class="action-btn send-btn hidden">
+                                    <span>↗</span>
+                                </button>
+                            </div>
+                        </div>
+                    </footer>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="ui.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
