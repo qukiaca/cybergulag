@@ -2,61 +2,83 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pear2P - Media</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: system-ui; background: #f8f9fa; }
-        .app { display: flex; height: 95vh; max-width: 1000px; margin: 1rem auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); overflow: hidden; }
-        #sidebar { width: 220px; background: #f1f3f5; border-right: 1px solid #dee2e6; display: flex; flex-direction: column; }
-        #sidebar h2 { padding: 1rem; font-size: 1rem; border-bottom: 1px solid #dee2e6; }
-        #contactList { list-style: none; padding: 0.5rem; overflow-y: auto; flex: 1; }
-        #contactList li { padding: 0.6rem 0.8rem; margin: 0.3rem 0; cursor: pointer; border-radius: 6px; transition: 0.2s; }
-        #contactList li:hover { background: #e9ecef; }
-        #contactList li.active { background: #d0ebff; font-weight: 500; }
-        #myId { padding: 0.8rem; background: #e9ecef; font-size: 0.85rem; text-align: center; border-top: 1px solid #dee2e6; }
-        
-        main { flex: 1; display: flex; flex-direction: column; padding: 1rem; position: relative; }
-        #chat { flex: 1; border: 1px solid #dee2e6; border-radius: 6px; overflow-y: auto; padding: 0.8rem; margin-bottom: 1rem; background: #f8f9fa; display: flex; flex-direction: column; gap: 10px; }
-        
-        .controls { display: flex; gap: 0.5rem; align-items: center; }
-        input { flex: 1; padding: 0.6rem; border: 1px solid #ced4da; border-radius: 6px; }
-        
-        /* Кнопка записи */
-        #recordBtn { width: 45px; height: 45px; border-radius: 50%; border: none; background: #339af0; color: white; cursor: pointer; font-size: 1.2rem; display: flex; align-items: center; justify-content: center; user-select: none; transition: 0.2s; }
-        #recordBtn.recording { background: #fa5252; animation: pulse 1.5s infinite; }
-        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
-
-        /* Стили сообщений */
-        .msg { max-width: 80%; padding: 8px; border-radius: 8px; background: white; box-shadow: 0 1px 2px rgba(0,0,0,0.1); align-self: flex-start; }
-        .msg.mine { align-self: flex-end; background: #d0ebff; }
-        .sys { align-self: center; color: #868e96; font-size: 0.8rem; }
-
-        /* Кружочки */
-        .video-circle { width: 200px; height: 200px; border-radius: 50%; object-fit: cover; border: 2px solid #339af0; background: #000; }
-        audio { height: 35px; }
-
-        /* Превью камеры при записи */
-        #videoPreview { position: absolute; bottom: 80px; right: 20px; width: 150px; height: 150px; border-radius: 50%; object-fit: cover; border: 3px solid #fa5252; display: none; background: #000; transform: scaleX(-1); }
-    </style>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Pear2P</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
-<body>
-    <div class="app">
-        <aside id="sidebar">
-            <h2>👥 Контакты</h2>
-            <ul id="contactList"></ul>
-            <div id="myId">Загрузка...</div>
-        </aside>
-        <main>
-            <div id="chat"></div>
-            <video id="videoPreview" autoplay muted playsinline></video>
-            <div class="controls">
-                <input id="msgInput" placeholder="Сообщение..." autocomplete="off" />
-                <button id="recordBtn" title="Зажать 1.5с для записи, клик для смены мода">🎤</button>
-                <button id="sendBtn" style="display:none;">📤</button>
-            </div>
-        </main>
+<body class="dark-theme"> <!-- По умолчанию темная -->
+
+    <div class="app-wrapper">
+        <div class="app-container">
+            <!-- Сайдбар -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <div class="logo">Pear2P</div>
+                    <button id="theme-toggle" class="icon-btn-circle"></button>
+                </div>
+                
+                <div class="user-card">
+                    <div class="avatar-placeholder" id="myAvatar"></div>
+                    <div class="user-info">
+                        <span>Ваш ID</span>
+                        <strong id="myId">Загрузка...</strong>
+                    </div>
+                </div>
+
+                <div class="contact-section">
+                    <div class="section-title">Активные контакты</div>
+                    <ul id="contactList" class="custom-scrollbar"></ul>
+                </div>
+            </aside>
+
+            <!-- Основная область -->
+            <main class="chat-area" id="chatArea">
+                <!-- Заглушка -->
+                <div id="welcome-screen" class="welcome-screen">
+                    <div class="welcome-content">
+                        <div class="welcome-icon">💬</div>
+                        <h2>Выберите чат</h2>
+                        <p>Начните безопасное p2p общение прямо сейчас</p>
+                    </div>
+                </div>
+
+                <!-- Чат -->
+                <div id="chat-view" class="chat-view hidden">
+                    <header class="chat-header">
+                        <button id="mobile-back" class="mobile-only-btn">←</button>
+                        <div class="active-user-info">
+                            <div class="status-dot"></div>
+                            <h2 id="activeContactId">Пользователь</h2>
+                        </div>
+                    </header>
+                    
+                    <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
+
+                    <video id="videoPreview" autoplay muted playsinline></video>
+
+                    <footer class="chat-input-container">
+                        <div class="input-wrapper">
+                            <input id="msgInput" type="text" placeholder="Напишите что-нибудь..." autocomplete="off">
+                            <div class="input-actions">
+                                <button id="recordBtn" class="action-btn">
+                                    <span id="mic-icon">🎤</span>
+                                    <span id="video-icon" class="hidden">📷</span>
+                                </button>
+                                <button id="sendBtn" class="action-btn send-btn hidden">
+                                    <span>↗</span>
+                                </button>
+                            </div>
+                        </div>
+                    </footer>
+                </div>
+            </main>
+        </div>
     </div>
-    <script src="client.js"></script>
+
+    <script src="ui.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>
