@@ -1,7 +1,171 @@
-const myId = prompt("Твой ID:") || "user_" + Math.random().toString(36).slice(2,6);
-let targetPeer = null;
+// Create and show login modal
+function createAuthModal() {
+    // Remove existing modal if any
+    const existingModal = document.getElementById('auth-modal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+    
+    // Create modal backdrop
+    const modalBackdrop = document.createElement('div');
+    modalBackdrop.id = 'auth-modal-backdrop';
+    modalBackdrop.style.position = 'fixed';
+    modalBackdrop.style.top = '0';
+    modalBackdrop.style.left = '0';
+    modalBackdrop.style.width = '100%';
+    modalBackdrop.style.height = '100%';
+    modalBackdrop.style.backgroundColor = 'rgba(0,0,0,0.5)';
+    modalBackdrop.style.display = 'flex';
+    modalBackdrop.style.alignItems = 'center';
+    modalBackdrop.style.justifyContent = 'center';
+    modalBackdrop.style.zIndex = '1000';
+    
+    // Create modal container
+    const modalContainer = document.createElement('div');
+    modalContainer.style.backgroundColor = '#1e1e1e';
+    modalContainer.style.color = '#fff';
+    modalContainer.style.padding = '2rem';
+    modalContainer.style.borderRadius = '8px';
+    modalContainer.style.width = '90%';
+    modalContainer.style.maxWidth = '400px';
+    modalContainer.style.boxShadow = '0 4px 6px rgba(0,0,0,0.1)';
+    
+    // Create modal content
+    modalContainer.innerHTML = `
+        <h2 style="margin-top: 0; text-align: center;">Pear2P</h2>
+        <div id="auth-error" style="color: #ff6b6b; margin-bottom: 1rem; min-height: 1.5rem; text-align: center;"></div>
+        <div style="margin-bottom: 1rem;">
+            <label style="display: block; margin-bottom: 0.5rem; font-size: 0.9rem;">Логин</label>
+            <input type="text" id="auth-username" style="width: 100%; padding: 0.75rem; border: 1px solid #444; border-radius: 4px; background: #2d2d2d; color: #fff; font-size: 1rem;">
+        </div>
+        <div style="margin-bottom: 1rem;">
+            <label style="display: block; margin-bottom: 0.5rem; font-size: 0.9rem;">Пароль</label>
+            <input type="password" id="auth-password" style="width: 100%; padding: 0.75rem; border: 1px solid #444; border-radius: 4px; background: #2d2d2d; color: #fff; font-size: 1rem;">
+        </div>
+        <div style="display: flex; gap: 1rem;">
+            <button id="auth-login" style="flex: 1; padding: 0.75rem; background: #4f46e5; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Войти</button>
+            <button id="auth-register" style="flex: 1; padding: 0.75rem; background: #10b981; color: white; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer;">Зарегистрироваться</button>
+        </div>
+    `;
+    
+    modalBackdrop.appendChild(modalContainer);
+    document.body.appendChild(modalBackdrop);
+    
+    return {
+        backdrop: modalBackdrop,
+        usernameInput: modalContainer.querySelector('#auth-username'),
+        passwordInput: modalContainer.querySelector('#auth-password'),
+        errorElement: modalContainer.querySelector('#auth-error'),
+        loginBtn: modalContainer.querySelector('#auth-login'),
+        registerBtn: modalContainer.querySelector('#auth-register')
+    };
+}
 
-document.getElementById("myId").textContent = myId;
+// Authentication flow with modal
+async function authenticateUser() {
+    const storedUsername = localStorage.getItem('pear2p-username');
+    if (storedUsername) {
+        return storedUsername;
+    }
+    
+    // Show modal
+    const modal = createAuthModal();
+    modal.backdrop.style.display = 'flex';
+    
+    // Return a promise that resolves when authentication succeeds
+    return new Promise((resolve, reject) => {
+        const attemptAuth = async (isRegister = false) => {
+            const username = modal.usernameInput.value.trim();
+            const password = modal.passwordInput.value.trim();
+            
+            if (!username || !password) {
+                modal.errorElement.textContent = 'Введите логин и пароль';
+                return;
+            }
+            
+            modal.errorElement.textContent = '';
+            modal.loginBtn.disabled = true;
+            modal.registerBtn.disabled = true;
+            
+            try {
+                const endpoint = isRegister ? '/api/register' : '/api/login';
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    let errorMessage = 'Ошибка аутентификации';
+                    if (response.status === 401) {
+                        errorMessage = 'Неверный логин или пароль';
+                    } else if (response.status === 409) {
+                        errorMessage = 'Пользователь уже существует';
+                    }
+                    modal.errorElement.textContent = errorMessage;
+                    modal.loginBtn.disabled = false;
+                    modal.registerBtn.disabled = false;
+                    return;
+                }
+                
+                const data = await response.json();
+                localStorage.setItem('pear2p-username', data.username);
+                
+                // Hide modal
+                modal.backdrop.style.display = 'none';
+                
+                resolve(data.username);
+            } catch (err) {
+                console.error('Auth error:', err);
+                modal.errorElement.textContent = 'Ошибка соединения с сервером';
+                modal.loginBtn.disabled = false;
+                modal.registerBtn.disabled = false;
+            }
+        };
+        
+        modal.loginBtn.addEventListener('click', () => attemptAuth(false));
+        modal.registerBtn.addEventListener('click', () => attemptAuth(true));
+        
+        // Allow Enter key to submit
+        modal.usernameInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') attemptAuth(false);
+        });
+        modal.passwordInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') attemptAuth(false);
+        });
+    });
+}
+
+// Initialize authentication and WebSocket connection
+async function initializeApp() {
+    try {
+        myId = await authenticateUser();
+        
+        // Set username in UI
+        document.getElementById("myId").textContent = myId;
+        
+        // Initialize WebSocket connection
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        window.ws = new WebSocket(`${protocol}//${location.host}/ws?user_id=${myId}`);
+        
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "contacts") renderContacts(msg.payload);
+            if (msg.type === "chat") displayMessage(msg.from, msg.payload, msg.mediaType);
+        };
+    } catch (err) {
+        console.error('Failed to initialize app:', err);
+        throw err;
+    }
+}
+
+// Start the app
+initializeApp().catch(err => {
+    console.error('Application failed to start:', err);
+    alert('Не удалось запустить приложение. Перезагрузите страницу.');
+});
+let targetPeer = null;
 
 let mediaMode = 'voice';
 let isRecording = false;
@@ -16,36 +180,46 @@ const recordBtn = document.getElementById("recordBtn");
 const videoPreview = document.getElementById("videoPreview");
 const contactList = document.getElementById("contactList");
 
-const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const ws = new WebSocket(`${protocol}//${location.host}/ws?user_id=${myId}`);
-
-ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === "contacts") renderContacts(msg.payload);
-    if (msg.type === "chat") displayMessage(msg.from, msg.payload, msg.mediaType);
-};
-
 function displayMessage(from, payload, type = 'text') {
     const div = document.createElement("div");
     div.className = `msg ${from === myId ? 'mine' : ''}`;
     
-    const name = from === myId ? "Вы" : from;
+    const displayName = from === myId ? "Вы" : from;
 
+    // Создаём имя безопасно — через textContent
+    const nameEl = document.createElement("strong");
+    nameEl.textContent = displayName;
+    nameEl.style.display = "block";
+    nameEl.style.fontSize = "0.7rem";
+    nameEl.style.opacity = "0.8";
+    nameEl.style.marginBottom = "4px";
+    div.appendChild(nameEl);
+
+    // Обрабатываем контент в зависимости от типа
     if (type === 'text') {
-        div.innerHTML = `<strong>${name}</strong>${payload}`;
+        // 🔒 Текст — ТОЛЬКО через textContent, никаких innerHTML
+        const textEl = document.createElement("span");
+        textEl.textContent = payload;
+        textEl.style.whiteSpace = "pre-wrap"; // сохраняем переносы строк
+        div.appendChild(textEl);
+        
     } else if (type === 'voice') {
+        // Base64 URL для audio src — безопасно, браузер сам экранирует
         const audio = document.createElement("audio");
         audio.src = payload;
         audio.controls = true;
-        div.innerHTML = `<strong>${name}</strong>`;
+        audio.style.maxWidth = "100%";
+        audio.style.marginTop = "8px";
         div.appendChild(audio);
+        
     } else if (type === 'video') {
         const video = document.createElement("video");
         video.src = payload;
         video.className = "video-circle";
         video.loop = true;
+        video.playsInline = true;
         video.onclick = () => video.paused ? video.play() : video.pause();
-        div.innerHTML = `<strong>${name}</strong>`;
+        video.style.marginTop = "8px";
         div.appendChild(video);
     }
 
@@ -145,5 +319,14 @@ const sendMessage = () => {
     }
 };
 
-msgInput.onkeydown = (e) => { if (e.key === "Enter") sendMessage(); };
-document.getElementById("sendBtn").onclick = sendMessage;
+// Add event listeners for sending messages
+msgInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+const sendBtn = document.getElementById('sendBtn');
+if (sendBtn) {
+    sendBtn.addEventListener('click', sendMessage);
+}

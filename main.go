@@ -5,13 +5,15 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
+
+	"pear2pear/config"
 
 	"github.com/gorilla/websocket"
-	_ "modernc.org/sqlite" // Импорт драйвера SQLite
+	_ "modernc.org/sqlite"
 )
-
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 type Peer struct {
 	ID   string
@@ -27,46 +29,31 @@ type Message struct {
 	MediaType string `json:"mediaType"`
 }
 
-var (
-	peers = make(map[string]*Peer)
-	mu    sync.RWMutex
-	db    *sql.DB // Наша глобальная переменная для БД
-)
-
-// Инициализация базы данных
-func initDB() {
-	var err error
-	db, err = sql.Open("sqlite", "./pear2p.db")
-	if err != nil {
-		log.Fatal("Ошибка открытия БД:", err)
-	}
-
-	// Создаем таблицу, если её нет
-	query := `
-	CREATE TABLE IF NOT EXISTS messages (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		from_user TEXT,
-		to_user TEXT,
-		payload TEXT,
-		media_type TEXT,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	);`
-	_, err = db.Exec(query)
-	if err != nil {
-		log.Fatal("Ошибка создания таблицы:", err)
-	}
-	log.Println("✅ База данных SQLite готова: pear2p.db")
+type Server struct {
+	peers    map[string]*Peer
+	mu       sync.RWMutex
+	db       *sql.DB
+	upgrader websocket.Upgrader
 }
 
-// Сохранение сообщения в БД
-func saveMessage(msg Message) {
-	// Конвертируем Payload в строку (так как там может быть текст или base64)
+func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB) *Server {
+	return &Server{
+		peers: make(map[string]*Peer),
+		db:    db,
+		upgrader: websocket.Upgrader{
+			CheckOrigin: validator.CheckOrigin,
+		},
+	}
+}
+
+func (s *Server) saveMessage(msg Message) {
 	payloadStr, ok := msg.Payload.(string)
 	if !ok {
+		log.Printf("🔧 Message payload is not string: %T", msg.Payload)
 		return
 	}
 
-	_, err := db.Exec(
+	_, err := s.db.Exec(
 		"INSERT INTO messages (from_user, to_user, payload, media_type) VALUES (?, ?, ?, ?)",
 		msg.From, msg.To, payloadStr, msg.MediaType,
 	)
@@ -75,10 +62,95 @@ func saveMessage(msg Message) {
 	}
 }
 
-// Отправка истории сообщений пользователю
-func sendHistory(p *Peer) {
-	// Берем последние 50 сообщений, где участвует этот пользователь
-	rows, err := db.Query(
+// Handle user registration
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+
+	// TODO: switch to bcrypt hashing in production
+	_, err := s.db.Exec(
+		"INSERT INTO users (username, password) VALUES (?, ?)",
+		req.Username, req.Password,
+	)
+	if err != nil {
+		// Check if it's a uniqueness constraint violation
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			http.Error(w, "username already exists", http.StatusConflict)
+			return
+		}
+		log.Printf("❌ Failed to register user %s: %v", req.Username, err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	resp := map[string]string{"username": req.Username}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// Handle user login
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, "username and password required", http.StatusBadRequest)
+		return
+	}
+
+	var storedPassword string
+	err := s.db.QueryRow(
+		"SELECT password FROM users WHERE username = ?",
+		req.Username,
+	).Scan(&storedPassword)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
+		log.Printf("❌ Failed to query user %s: %v", req.Username, err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// TODO: switch to bcrypt hashing in production
+	if storedPassword != req.Password {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	resp := map[string]string{"username": req.Username}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) sendHistory(p *Peer) {
+	rows, err := s.db.Query(
 		`SELECT from_user, to_user, payload, media_type FROM messages 
 		 WHERE from_user = ? OR to_user = ? 
 		 ORDER BY created_at ASC LIMIT 50`,
@@ -95,105 +167,220 @@ func sendHistory(p *Peer) {
 		var payloadStr string
 		err := rows.Scan(&msg.From, &msg.To, &payloadStr, &msg.MediaType)
 		if err != nil {
+			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
 		}
 		msg.Type = "chat"
 		msg.Payload = payloadStr
 
-		// Отправляем каждое сообщение из истории пользователю
 		p.mu.Lock()
-		p.Conn.WriteJSON(msg)
+		err = p.Conn.WriteJSON(msg)
 		p.mu.Unlock()
+		if err != nil {
+			log.Printf("⚠️  Failed to send history to %s: %v", p.ID, err)
+		}
 	}
 }
 
-func broadcastContacts() {
-	mu.RLock()
-	users := make([]string, 0, len(peers))
-	conns := make([]*Peer, 0, len(peers))
+func (s *Server) broadcastContacts() {
+	s.mu.RLock()
+	peers := make([]*Peer, 0, len(s.peers))
+	for _, p := range s.peers {
+		peers = append(peers, p)
+	}
+	s.mu.RUnlock()
+
+	msg := Message{Type: "contacts"}
+	var ids []string
 	for _, p := range peers {
-		users = append(users, p.ID)
-		conns = append(conns, p)
+		ids = append(ids, p.ID)
 	}
-	mu.RUnlock()
-
-	msg := Message{Type: "contacts", Payload: users}
-	data, _ := json.Marshal(msg)
-
-	for _, p := range conns {
-		p.mu.Lock()
-		p.Conn.WriteMessage(websocket.TextMessage, data)
-		p.mu.Unlock()
-	}
-}
-
-func handleWS(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
+	msg.Payload = ids
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("❌ Failed to marshal contacts: %v", err)
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	for _, p := range peers {
+		p.mu.Lock()
+		err := p.Conn.WriteMessage(websocket.TextMessage, data)
+		p.mu.Unlock()
+		if err != nil {
+			log.Printf("⚠️  Failed to broadcast contacts to %s: %v", p.ID, err)
+			// Note: We don't remove the peer here to avoid holding s.mu
+			// Peer cleanup happens in handleWS defer
+		}
+	}
+}
+
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	if userID == "" {
+		http.Error(w, "missing user_id", http.StatusBadRequest)
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 
-	p := &Peer{ID: userID, Conn: conn}
-	mu.Lock()
-	peers[userID] = p
-	mu.Unlock()
+	// Set up keep-alive with ping/pong
+	conn.SetPongHandler(func(appData string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-	// 1. Сначала рассылаем контакты
-	broadcastContacts()
-	// 2. Затем отправляем историю из БД
-	sendHistory(p)
+	// Handle connection - instant reconnect without delay
+	s.mu.Lock()
+	existingPeer, exists := s.peers[userID]
+	var isReconnect bool
+	if exists {
+		isReconnect = true
+		// Update connection for existing peer
+		existingPeer.mu.Lock()
+		existingPeer.Conn = conn
+		existingPeer.mu.Unlock()
+	} else {
+		// New peer
+		p := &Peer{ID: userID, Conn: conn}
+		s.peers[userID] = p
+		isReconnect = false
+	}
+	s.mu.Unlock()
 
-	log.Printf("👤 Вошел: %s", userID)
+	// Only broadcast contacts and send history for new connections
+	if !isReconnect {
+		s.broadcastContacts()
+		s.sendHistory(&Peer{ID: userID, Conn: conn}) // Temporary peer for history
+		log.Printf("👤 Вошел: %s", userID)
+	} else {
+		log.Printf("🔁 Переподключение: %s", userID)
+	}
+
+	// Start ping ticker
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(50 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("⚠️  Ping failed for %s: %v", userID, err)
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
 
 	defer func() {
-		mu.Lock()
-		delete(peers, userID)
-		mu.Unlock()
 		conn.Close()
-		broadcastContacts()
-		log.Printf("👤 Вышел: %s", userID)
+		s.mu.Lock()
+		peer, exists := s.peers[userID]
+		if exists && peer.Conn == conn {
+			delete(s.peers, userID)
+			s.mu.Unlock()
+			s.broadcastContacts()
+			log.Printf("👤 Вышел: %s", userID)
+		} else {
+			s.mu.Unlock()
+		}
 	}()
 
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("⚠️  WebSocket closed unexpectedly for %s: %v", userID, err)
+			}
 			break
 		}
 
 		var msg Message
 		if json.Unmarshal(msgBytes, &msg) != nil {
+			log.Printf("🔧 Failed to unmarshal message from %s: %v", userID, err)
 			continue
 		}
 		msg.From = userID
 
-		// 3. Сохраняем сообщение в БД перед отправкой
 		if msg.Type == "chat" {
-			saveMessage(msg)
+			s.saveMessage(msg)
 		}
 
-		mu.RLock()
-		target, ok := peers[msg.To]
-		mu.RUnlock()
+		s.mu.RLock()
+		target, ok := s.peers[msg.To]
+		s.mu.RUnlock()
 
 		if ok {
 			target.mu.Lock()
-			target.Conn.WriteJSON(msg)
+			err := target.Conn.WriteJSON(msg)
+			if err != nil {
+				log.Printf("⚠️  Failed to send message to %s: %v", target.ID, err)
+			}
 			target.mu.Unlock()
 		}
 	}
 }
 
+func initDB() *sql.DB {
+	db, err := sql.Open("sqlite", "./pear2p.db")
+	if err != nil {
+		log.Fatal("Ошибка открытия БД:", err)
+	}
+
+	// Create messages table
+	messagesQuery := `
+	CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_user TEXT,
+		to_user TEXT,
+		payload TEXT,
+		media_type TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(messagesQuery)
+	if err != nil {
+		log.Fatal("Ошибка создания таблицы messages:", err)
+	}
+
+	// Create users table for authentication
+	usersQuery := `
+	CREATE TABLE IF NOT EXISTS users (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT UNIQUE NOT NULL,
+		password TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(usersQuery)
+	if err != nil {
+		log.Fatal("Ошибка создания таблицы users:", err)
+	}
+	// TODO: switch to bcrypt hashing in production
+
+	log.Println("✅ База данных SQLite готова: pear2p.db")
+	return db
+}
+
 func main() {
-	initDB() // Запуск БД
+	cfg := config.Load()
+	validator := config.NewOriginValidator(cfg.AllowedOrigins)
+	db := initDB()
 	defer db.Close()
 
-	http.HandleFunc("/ws", handleWS)
+	srv := NewServer(cfg, validator, db)
+
+	http.HandleFunc("/ws", srv.handleWS)
+	http.HandleFunc("/api/register", srv.handleRegister)
+	http.HandleFunc("/api/login", srv.handleLogin)
 	http.Handle("/", http.FileServer(http.Dir(".")))
-	log.Println("🚀 Pear2P запущен на http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	log.Printf("🚀 Pear2P запущен на http://localhost:%s", cfg.Port)
+	log.Printf("🔒 Allowed origins: %s", validator)
+	log.Fatal(http.ListenAndServe(":"+cfg.Port, nil))
 }
