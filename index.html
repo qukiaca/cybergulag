@@ -23,7 +23,7 @@
                 <div class="user-card">
                     <div class="avatar-placeholder" id="myAvatar"></div>
                     <div class="user-info">
-                        <span>Ваш ID</span>
+                        <span>Ваш ID <span id="connection-status" title="Соединение">🔴</span></span>
                         <strong id="myId">Загрузка...</strong>
                     </div>
                 </div>
@@ -45,40 +45,44 @@
                     </div>
                 </div>
 
-                <!-- Чат -->
-                <div id="chat-view" class="chat-view hidden">
-                    <header class="chat-header">
-                        <button id="mobile-back" class="mobile-only-btn">←</button>
-                        <div class="active-user-info">
-                            <div class="status-dot"></div>
-                            <h2 id="activeContactId">Пользователь</h2>
-                        </div>
-                    </header>
-                    
-                    <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
-
-                    <video id="videoPreview" autoplay muted playsinline></video>
-
-                    <footer class="chat-input-container">
-                        <div class="input-wrapper">
-                            <input id="msgInput" type="text" placeholder="Напишите что-нибудь..." autocomplete="off">
-                            <div class="input-actions">
-                                <button id="recordBtn" class="action-btn">
-                                    <span id="mic-icon">🎤</span>
-                                    <span id="video-icon" class="hidden">📷</span>
-                                </button>
-                                <button id="sendBtn" class="action-btn send-btn hidden">
-                                    <span>↗</span>
-                                </button>
-                            </div>
-                        </div>
-                    </footer>
-                </div>
-            </main>
+<!-- Чат -->
+<div id="chat-view" class="chat-view hidden">
+    <header class="chat-header">
+        <button id="mobile-back" class="mobile-only-btn">←</button>
+        <div class="active-user-info">
+            <div class="status-dot"></div>
+            <h2 id="activeContactId">Пользователь</h2>
         </div>
-    </div>
+    </header>
+    
+    <div class="chat-container">
+        <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
 
-    <script src="ui.js"></script>
-    <script src="app.js"></script>
+        <video id="videoPreview" autoplay muted playsinline></video>
+
+        <footer class="chat-input-container">
+            <div class="input-wrapper">
+                <textarea id="msgInput" placeholder="Напишите что-нибудь..." autocomplete="off" rows="1"></textarea>
+                <div class="input-actions">
+                    <button id="recordBtn" class="action-btn">
+                        <span id="mic-icon">🎤</span>
+                        <span id="video-icon" class="hidden">📷</span>
+                    </button>
+                    <span id="record-timer" class="hidden">00:00</span>
+                    <span id="record-toast" class="toast hidden"></span>
+                    <button id="sendBtn" class="action-btn send-btn hidden">
+                        <span>↗</span>
+                    </button>
+                </div>
+            </div>
+        </footer>
+    </div>
+</div>
+</main>
+</div>
+</div>
+
+    <script src="ui.js" defer></script>
+    <script src="app.js" defer></script>
 </body>
 </html>
