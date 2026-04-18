@@ -140,16 +140,30 @@ body {
 
 /* Индикаторы статуса в списке контактов */
 .contact.online::before {
-    content: "🟢 ";
-    font-size: 0.9em;
+    content: "";
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    background: url('./assets/online_status.svg') no-repeat center;
+    background-size: contain;
     vertical-align: middle;
 }
 
 .contact.offline::before {
-    content: "⚪ ";
-    font-size: 0.9em;
-    vertical-align: middle;
+    content: "";
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    background: url('./assets/offline_status.svg') no-repeat center;
+    background-size: contain;
     opacity: 0.6;
+    vertical-align: middle;
+}
+
+body.dark-theme .contact::before {
+    filter: invert(1) brightness(0.9);
 }
 
 /* Альтернатива: цветные точки вместо эмодзи (раскомментируй если нужно)
@@ -296,6 +310,12 @@ body {
 }
 .send-btn { background: var(--accent); color: white; }
 .action-btn:hover { transform: scale(1.05); }
+
+.action-btn img { width: 24px; height: 24px; object-fit: contain; }
+
+body.dark-theme .action-btn img { filter: invert(1) brightness(0.9); }
+
+#theme-toggle img { width: 24px; height: 24px; }
 
 /* Анимация записи */
 @keyframes pulse {

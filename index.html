@@ -23,7 +23,7 @@
                 <div class="user-card">
                     <div class="avatar-placeholder" id="myAvatar"></div>
                     <div class="user-info">
-                        <span>Ваш ID <span id="connection-status" title="Соединение">🔴</span></span>
+                        <span>Вы <span id="connection-status" title="Соединение">🔴</span></span>
                         <strong id="myId">Загрузка...</strong>
                     </div>
                 </div>
@@ -65,13 +65,13 @@
                 <textarea id="msgInput" placeholder="Напишите что-нибудь..." autocomplete="off" rows="1"></textarea>
                 <div class="input-actions">
                     <button id="recordBtn" class="action-btn">
-                        <span id="mic-icon">🎤</span>
-                        <span id="video-icon" class="hidden">📷</span>
+                        <img src="./assets/mic.svg" alt="Микрофон" id="mic-icon">
+                        <img src="./assets/video.svg" alt="Видео" id="video-icon" class="hidden">
                     </button>
                     <span id="record-timer" class="hidden">00:00</span>
                     <span id="record-toast" class="toast hidden"></span>
                     <button id="sendBtn" class="action-btn send-btn hidden">
-                        <span>↗</span>
+                        <img src="./assets/send.svg" alt="Отправить">
                     </button>
                 </div>
             </div>

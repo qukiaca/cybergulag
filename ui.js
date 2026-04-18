@@ -9,7 +9,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // --- Темы ---
     const updateThemeIcon = (isDark) => {
-        themeBtn.textContent = isDark ? "☀️" : "🌙";
+        themeBtn.innerHTML = `<img src="./assets/${isDark ? 'sun.svg' : 'moon.svg'}" alt="Тема">`;
     };
 
     themeBtn.addEventListener("click", () => {

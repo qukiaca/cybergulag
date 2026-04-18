@@ -581,10 +581,11 @@ function renderContactList() {
     allUsers.forEach(id => {
         if (id === myId) return;
         const li = document.createElement("li");
-        li.textContent = id;
         li.dataset.user = id;
         li.classList.add("contact");
         li.classList.add(onlineUsers.has(id) ? "online" : "offline");
+        li.textContent = id;
+        
         li.onclick = async () => {
             // ✅ Правило 4: При смене диалога
             // 1. Очистить чат
