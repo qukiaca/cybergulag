@@ -6,10 +6,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,6 +20,7 @@ import (
 
 	"pear2pear/config"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
@@ -30,18 +34,22 @@ type Peer struct {
 
 type Message struct {
 	Type      string `json:"type"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Payload   any    `json:"payload"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Payload  any    `json:"payload"`
 	MediaType string `json:"mediaType"`
+	FileName string `json:"fileName,omitempty"`
+	FileSize int64  `json:"fileSize,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
 }
 
 type Server struct {
-	peers           map[string]*Peer
-	mu              sync.RWMutex
-	db              *sql.DB
-	upgrader        websocket.Upgrader
-	lastUserRequest map[string]time.Time
+	peers            map[string]*Peer
+	mu               sync.RWMutex
+	db               *sql.DB
+	upgrader         websocket.Upgrader
+	lastUserRequest  map[string]time.Time
+	fileStoragePath  string
 }
 
 func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB) *Server {
@@ -58,6 +66,7 @@ func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB)
 			},
 		},
 		lastUserRequest: make(map[string]time.Time),
+		fileStoragePath: cfg.FileStoragePath,
 	}
 }
 
@@ -68,16 +77,33 @@ func (s *Server) saveMessage(msg Message) {
 		return
 	}
 
-	// Проверка размера payload: лимит 1MB
-	const maxPayloadSize = 1 * 1024 * 1024 // 1 MB
+	const maxPayloadSize = 1 * 1024 * 1024
 	if len(payloadStr) > maxPayloadSize {
 		log.Printf("⚠️ Payload too large: %d bytes from %s, limit: %d", len(payloadStr), msg.From, maxPayloadSize)
 		return
 	}
 
+	var fileName, mimeType string
+	var fileSize int64
+
+	if msg.MediaType == "file" || msg.MediaType == "media" {
+		fileName = msg.FileName
+		fileSize = msg.FileSize
+		mimeType = msg.MimeType
+
+		if fileName == "" && strings.HasPrefix(payloadStr, "/api/file/") {
+			fileUUID := strings.TrimPrefix(payloadStr, "/api/file/")
+			s.db.QueryRow(
+				"SELECT file_name, file_size, mime_type FROM file_uploads WHERE file_uuid = ?",
+				fileUUID,
+			).Scan(&fileName, &fileSize, &mimeType)
+		}
+	}
+
 	_, err := s.db.Exec(
-		"INSERT INTO messages (from_user, to_user, payload, media_type) VALUES (?, ?, ?, ?)",
-		msg.From, msg.To, payloadStr, msg.MediaType,
+		`INSERT INTO messages (from_user, to_user, payload, media_type, file_name, file_size, mime_type)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		msg.From, msg.To, payloadStr, msg.MediaType, fileName, fileSize, mimeType,
 	)
 	if err != nil {
 		log.Println("❌ Ошибка сохранения в БД:", err)
@@ -280,17 +306,15 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Получаем user_id из WebSocket (через query param или cookie)
-	// В этом эндпоинте используем заголовок X-User-ID (устанавливается фронтендом)
 	userID := r.Header.Get("X-User-ID")
 	if userID == "" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Запрос сообщений между двумя пользователями
 	rows, err := s.db.Query(
-		`SELECT from_user, to_user, payload, media_type FROM messages 
+		`SELECT from_user, to_user, payload, media_type, file_name, file_size, mime_type
+		 FROM messages
 		 WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
 		 ORDER BY id ASC LIMIT 50`,
 		userID, targetUser, targetUser, userID,
@@ -302,16 +326,31 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	var messages []Message
+	var messages []map[string]interface{}
 	for rows.Next() {
-		var msg Message
-		var payloadStr string
-		if err := rows.Scan(&msg.From, &msg.To, &payloadStr, &msg.MediaType); err != nil {
+		var from, to, payload, mediaType string
+		var fileName, mimeType sql.NullString
+		var fileSize int64
+		if err := rows.Scan(&from, &to, &payload, &mediaType, &fileName, &fileSize, &mimeType); err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
 		}
-		msg.Type = "chat"
-		msg.Payload = payloadStr
+		msg := map[string]interface{}{
+			"from":      from,
+			"to":        to,
+			"payload":   payload,
+			"mediaType": mediaType,
+			"type":      "chat",
+		}
+		if fileName.Valid {
+			msg["fileName"] = fileName.String
+		}
+		if fileSize > 0 {
+			msg["fileSize"] = fileSize
+		}
+		if mimeType.Valid {
+			msg["mimeType"] = mimeType.String
+		}
 		messages = append(messages, msg)
 	}
 
@@ -321,10 +360,240 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	log.Printf("📥 handleUpload: method=%s", r.Method)
+
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		log.Printf("❌ ParseMultipartForm: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.FormValue("user_id")
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	toUser := r.FormValue("to_user")
+	log.Printf("📥 handleUpload: user=%s, to=%s", userID, toUser)
+	if toUser == "" {
+		http.Error(w, "missing to_user", http.StatusBadRequest)
+		return
+	}
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	fileSize := header.Size
+	var expiresAt *time.Time
+
+	const (
+		MB128 = 128 * 1024 * 1024
+		GB1   = 1024 * 1024 * 1024
+	)
+
+	if fileSize > GB1 {
+		t := time.Now().Add(7 * 24 * time.Hour)
+		expiresAt = &t
+	} else if fileSize > MB128 {
+		t := time.Now().Add(30 * 24 * time.Hour)
+		expiresAt = &t
+	}
+
+	fileUUID := uuid.New().String()
+	filePath := filepath.Join(s.fileStoragePath, fileUUID)
+
+	dst, err := os.Create(filePath)
+	if err != nil {
+		log.Printf("❌ Ошибка создания файла: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		log.Printf("❌ Ошибка записи файла: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+
+	var expiresAtStr *string
+	if expiresAt != nil {
+		s := expiresAt.Format("2006-01-02 15:04:05")
+		expiresAtStr = &s
+	}
+
+	_, err = s.db.Exec(
+		`INSERT INTO file_uploads (from_user, to_user, file_uuid, file_path, file_name, file_size, mime_type, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, toUser, fileUUID, filePath, header.Filename, fileSize, mimeType, expiresAtStr,
+	)
+	if err != nil {
+		log.Printf("❌ Ошибка сохранения в БД: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	var fileID int64
+	err = s.db.QueryRow("SELECT last_insert_rowid()").Scan(&fileID)
+	if err != nil {
+		log.Printf("⚠️ Не удалось получить file_id: %v", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"file_id":   fileID,
+		"url":      "/api/file/" + fileUUID,
+		"fileName": header.Filename,
+		"fileSize": fileSize,
+		"mimeType": mimeType,
+	})
+}
+
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	userID := r.Header.Get("X-User-ID")
+	if userID == "" {
+		userID = r.URL.Query().Get("token")
+	}
+	if userID == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	fileUUID := strings.TrimPrefix(r.URL.Path, "/api/file/")
+	if fileUUID == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	var (
+		id        int64
+		fromUser  string
+		toUser    string
+		filePath  string
+		fileName  string
+		fileSize  int64
+		mimeType  string
+		expiresAt sql.NullString
+	)
+	err := s.db.QueryRow(
+		`SELECT id, from_user, to_user, file_path, file_name, file_size, mime_type, expires_at
+		 FROM file_uploads WHERE file_uuid = ?`,
+		fileUUID,
+	).Scan(&id, &fromUser, &toUser, &filePath, &fileName, &fileSize, &mimeType, &expiresAt)
+
+	if err == sql.ErrNoRows {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		log.Printf("❌ Ошибка поиска файла: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	if userID != fromUser && userID != toUser {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	if expiresAt.Valid {
+		expiresTime, err := time.Parse("2006-01-02 15:04:05", expiresAt.String)
+		if err == nil && expiresTime.Before(time.Now()) {
+			s.db.Exec("DELETE FROM file_uploads WHERE id = ?", id)
+			os.Remove(filePath)
+			http.Error(w, "file expired", http.StatusGone)
+			return
+		}
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		log.Printf("❌ Ошибка stat файла: %v", err)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("❌ Ошибка открытия файла: %v", err)
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	w.Header().Set("Content-Type", mimeType)
+
+	isMedia := strings.HasPrefix(mimeType, "image/") ||
+		strings.HasPrefix(mimeType, "video/") ||
+		strings.HasPrefix(mimeType, "audio/")
+	if isMedia {
+		w.Header().Set("Content-Disposition", "inline; filename=\""+fileName+"\"")
+	} else {
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+fileName+"\"")
+	}
+
+	w.Header().Set("Content-Length", fmt.Sprint(fileSize))
+
+	http.ServeContent(w, r, fileName, info.ModTime(), f)
+}
+
+func (s *Server) cleanupExpiredFiles() {
+	rows, err := s.db.Query("SELECT id, file_path FROM file_uploads WHERE expires_at IS NOT NULL AND expires_at < datetime('now')")
+	if err != nil {
+		log.Printf("❌ Ошибка поиска просроченных файлов: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var count, fileErrs, dbErrs int
+	for rows.Next() {
+		var id int64
+		var filePath string
+		if err := rows.Scan(&id, &filePath); err != nil {
+			continue
+		}
+		if err := os.Remove(filePath); err != nil {
+			log.Printf("⚠️ Ошибка удаления файла %s: %v", filePath, err)
+			fileErrs++
+			continue
+		}
+		if _, err := s.db.Exec("DELETE FROM file_uploads WHERE id = ?", id); err != nil {
+			log.Printf("⚠️ Ошибка удаления записи БД id=%d: %v", id, err)
+			dbErrs++
+			continue
+		}
+		count++
+	}
+	if count > 0 {
+		log.Printf("🧹 Удалено %d просроченных файлов (ошибок: файлов=%d, БД=%d)", count, fileErrs, dbErrs)
+	}
+}
+
 func (s *Server) sendHistory(p *Peer) {
 	rows, err := s.db.Query(
-		`SELECT from_user, to_user, payload, media_type FROM messages 
-		 WHERE from_user = ? OR to_user = ? 
+		`SELECT from_user, to_user, payload, media_type, file_name, file_size, mime_type FROM messages
+		 WHERE from_user = ? OR to_user = ?
 		 ORDER BY id ASC LIMIT 50`,
 		p.ID, p.ID,
 	)
@@ -337,13 +606,23 @@ func (s *Server) sendHistory(p *Peer) {
 	for rows.Next() {
 		var msg Message
 		var payloadStr string
-		err := rows.Scan(&msg.From, &msg.To, &payloadStr, &msg.MediaType)
+		var fileName, mimeType sql.NullString
+		var fileSize int64
+		err := rows.Scan(&msg.From, &msg.To, &payloadStr, &msg.MediaType, &fileName, &fileSize, &mimeType)
 		if err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
 		}
 		msg.Type = "chat"
 		msg.Payload = payloadStr
+
+		if fileName.Valid {
+			msg.FileName = fileName.String
+		}
+		if mimeType.Valid {
+			msg.MimeType = mimeType.String
+		}
+		msg.FileSize = fileSize
 
 		p.mu.Lock()
 		err = p.Conn.WriteJSON(msg)
@@ -550,12 +829,20 @@ func initDB() *sql.DB {
 		to_user TEXT,
 		payload TEXT,
 		media_type TEXT,
+		file_name TEXT,
+		file_size INTEGER DEFAULT 0,
+		mime_type TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
 	_, err = db.Exec(messagesQuery)
 	if err != nil {
 		log.Fatal("Ошибка создания таблицы messages:", err)
 	}
+
+	// Добавить колонки если не существуют (миграция для существующей БД)
+	db.Exec("ALTER TABLE messages ADD COLUMN file_name TEXT;")
+	db.Exec("ALTER TABLE messages ADD COLUMN file_size INTEGER DEFAULT 0;")
+	db.Exec("ALTER TABLE messages ADD COLUMN mime_type TEXT;")
 
 	// Create users table for authentication
 	usersQuery := `
@@ -582,12 +869,56 @@ func initDB() *sql.DB {
 		}
 	}
 
+	// Таблица для загрузки файлов
+	fileUploadsQuery := `
+	CREATE TABLE IF NOT EXISTS file_uploads (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		from_user TEXT NOT NULL,
+		to_user TEXT NOT NULL,
+		file_uuid TEXT UNIQUE NOT NULL,
+		file_path TEXT NOT NULL,
+		file_name TEXT NOT NULL,
+		file_size INTEGER NOT NULL,
+		mime_type TEXT NOT NULL,
+		expires_at DATETIME,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	_, err = db.Exec(fileUploadsQuery)
+	if err != nil {
+		log.Fatal("Ошибка создания таблицы file_uploads:", err)
+	}
+
+	// Индексы для файлов
+	fileIndexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_expires ON file_uploads(expires_at);",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_uuid ON file_uploads(file_uuid);",
+	}
+	for _, idx := range fileIndexes {
+		if _, e := db.Exec(idx); e != nil {
+			log.Printf("⚠️ Не удалось создать индекс: %v", e)
+		}
+	}
+
+	log.Println("✅ Таблица file_uploads готова")
+
 	log.Println("✅ База данных SQLite готова: pear2p.db")
 	return db
 }
 
+func ensureStorageDir(cfg config.Config) {
+	if _, err := os.Stat(cfg.FileStoragePath); os.IsNotExist(err) {
+		if err := os.MkdirAll(cfg.FileStoragePath, 0755); err != nil {
+			log.Fatal("❌ Не удалось создать директорию хранилища:", err)
+		}
+		log.Printf("📁 Создана директория хранилища: %s", cfg.FileStoragePath)
+	}
+	log.Printf("📁 Хранилище файлов: %s", cfg.FileStoragePath)
+}
+
 func main() {
 	cfg := config.Load()
+	ensureStorageDir(cfg)
+
 	validator := config.NewOriginValidator(cfg.AllowedOrigins)
 	db := initDB()
 
@@ -600,11 +931,21 @@ func main() {
 
 	srv := NewServer(cfg, validator, db)
 
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			srv.cleanupExpiredFiles()
+		}
+	}()
+
 	http.HandleFunc("/ws", srv.handleWS)
 	http.HandleFunc("/api/register", srv.handleRegister)
 	http.HandleFunc("/api/login", srv.handleLogin)
 	http.HandleFunc("/api/users", srv.handleGetUsers)
 	http.HandleFunc("/api/history", srv.handleGetHistory)
+	http.HandleFunc("/api/upload", srv.handleUpload)
+	http.HandleFunc("/api/file/", srv.handleDownload)
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
 	// Создаём HTTP сервер для graceful shutdown

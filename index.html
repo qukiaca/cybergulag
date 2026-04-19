@@ -54,14 +54,26 @@
             <h2 id="activeContactId">Пользователь</h2>
         </div>
     </header>
-    
+
     <div class="chat-container">
         <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
+
+        <div id="drop-overlay" class="drop-overlay hidden">
+            <div class="drop-content">
+                <img src="./assets/attach.svg" alt="Drop" class="drop-icon">
+                <h3>Отпустите файл для отправки</h3>
+                <p>Поддерживаются изображения, видео, аудио и документы</p>
+            </div>
+        </div>
 
         <video id="videoPreview" autoplay muted playsinline></video>
 
         <footer class="chat-input-container">
             <div class="input-wrapper">
+                <button id="fileBtn" class="action-btn" title="Прикрепить файл">
+                    <img src="./assets/attach.svg" alt="Файл">
+                </button>
+                <input type="file" id="fileInput" hidden multiple accept="*/*">
                 <textarea id="msgInput" placeholder="Напишите что-нибудь..." autocomplete="off" rows="1"></textarea>
                 <div class="input-actions">
                     <button id="recordBtn" class="action-btn">
@@ -81,6 +93,27 @@
 </main>
 </div>
 </div>
+
+    <!-- File confirm modal -->
+    <div id="file-confirm-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <div id="file-preview-container" class="file-preview-container"></div>
+            <div class="file-info">
+                <div id="file-name" class="file-name"></div>
+                <div id="file-size-display" class="file-size"></div>
+            </div>
+            <div class="modal-buttons">
+                <button id="cancel-file-btn" class="btn btn-secondary">Отмена</button>
+                <button id="send-file-btn" class="btn btn-primary">Отправить</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Media Viewer (Lightbox) -->
+    <div id="media-viewer" class="media-viewer hidden" onclick="closeMediaViewer(event)">
+        <button class="close-viewer" onclick="closeMediaViewer(event)">×</button>
+        <div id="media-viewer-content"></div>
+    </div>
 
     <script src="ui.js" defer></script>
     <script src="app.js" defer></script>

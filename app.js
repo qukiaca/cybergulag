@@ -251,7 +251,7 @@ function connectWebSocket() {
                 }
                 if (msg.type === "chat") {
                     // Передаём: from, to, payload, mediaType
-                    displayMessage(msg.from, msg.to, msg.payload, msg.mediaType);
+                    displayMessage(msg.from, msg.to, msg.payload, msg.mediaType, { fileName: msg.fileName, fileSize: msg.fileSize, mimeType: msg.mimeType });
                 }
             } catch (err) {
                 console.error('❌ Ошибка парсинга сообщения:', err, 'raw:', e.data);
@@ -343,6 +343,406 @@ const recordBtn = document.getElementById("recordBtn");
 const videoPreview = document.getElementById("videoPreview");
 const contactList = document.getElementById("contactList");
 
+const MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime', 'audio/mpeg', 'audio/mp3', 'audio/ogg', 'audio/wav'];
+const FILE_SIZE_LIMIT = 128 * 1024 * 1024;
+
+const fileBtn = document.getElementById('fileBtn');
+const fileInput = document.getElementById('fileInput');
+const dropOverlay = document.getElementById('drop-overlay');
+const chatArea = document.getElementById('chatArea');
+
+fileBtn?.addEventListener('click', () => fileInput?.click());
+
+fileInput?.addEventListener('change', () => {
+    if (fileInput.files.length) {
+        handleFiles(fileInput.files);
+        fileInput.value = '';
+    }
+});
+
+chatArea?.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropOverlay?.classList.remove('hidden');
+});
+
+chatArea?.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget && chatArea.contains(e.relatedTarget)) return;
+    dropOverlay?.classList.add('hidden');
+});
+
+chatArea?.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropOverlay?.classList.add('hidden');
+    handleFiles(e.dataTransfer.files);
+});
+
+function formatBytes(bytes) {
+    if (!bytes || bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function getFileIcon(mimeType) {
+    if (mimeType?.startsWith('image/')) return '🖼️';
+    if (mimeType?.startsWith('video/')) return '🎬';
+    if (mimeType?.startsWith('audio/')) return '🎵';
+    return '📄';
+}
+
+async function handleFiles(files) {
+    console.log('📁 handleFiles START');
+    console.log('  files:', files?.length);
+    console.log('  targetPeer:', targetPeer);
+    console.log('  myId:', myId);
+
+    if (!targetPeer) {
+        alert('Выберите получателя');
+        return;
+    }
+
+    if (!myId) {
+        console.error('❌ myId is not defined!');
+        alert('Ошибка: пользователь не авторизован');
+        return;
+    }
+
+    for (const file of files) {
+        console.log('📦 Processing file:', file.name);
+        await showFileConfirmModal(file, targetPeer);
+    }
+}
+
+let pendingFile = null;
+let pendingFileTarget = null;
+let previewObjectURL = null;
+
+function showFileConfirmModal(file, targetPeer) {
+    return new Promise((resolve) => {
+        try {
+            console.log('🔧 [1/6] showFileConfirmModal START');
+
+            pendingFile = file;
+            pendingFileTarget = targetPeer;
+
+            const modal = document.getElementById('file-confirm-modal');
+            const previewContainer = document.getElementById('file-preview-container');
+            const nameEl = document.getElementById('file-name');
+            const sizeEl = document.getElementById('file-size-display');
+            const sendBtn = document.getElementById('send-file-btn');
+            const cancelBtn = document.getElementById('cancel-file-btn');
+
+            console.log('🔍 [2/6] Elements check:', {
+                modal: !!modal,
+                previewContainer: !!previewContainer,
+                nameEl: !!nameEl,
+                sizeEl: !!sizeEl,
+                sendBtn: !!sendBtn,
+                cancelBtn: !!cancelBtn
+            });
+
+            if (!modal || !previewContainer || !nameEl || !sizeEl || !sendBtn || !cancelBtn) {
+                console.error('❌ Missing required elements!');
+                alert('Ошибка интерфейса: не найдены элементы модалки');
+                resolve();
+                return;
+            }
+
+            try {
+                previewContainer.innerHTML = '';
+                nameEl.textContent = file.name || 'unknown';
+                sizeEl.textContent = formatBytes(file.size || 0);
+                console.log('📦 [3/6] File info set');
+            } catch (err) {
+                console.error('❌ Error setting file info:', err);
+            }
+
+            const ext = (file.name || '').split('.').pop()?.toLowerCase() || '';
+            const mime = (file.type || '').toLowerCase() || '';
+            const isImage = mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext);
+            const isVideo = mime.startsWith('video/') || ['mp4', 'webm', 'mov', 'avi'].includes(ext);
+            const isAudio = mime.startsWith('audio/') || ['mp3', 'wav', 'ogg', 'm4a'].includes(ext);
+
+            console.log('🎨 [4/6] Type check:', { ext, mime, isImage, isVideo, isAudio });
+
+            try {
+                previewObjectURL = URL.createObjectURL(file);
+                console.log('🔗 ObjectURL created:', previewObjectURL?.substring(0, 50) + '...');
+
+                if (isImage) {
+                    console.log('🖼️ Creating image preview...');
+                    const img = document.createElement('img');
+                    img.style.maxWidth = '100%';
+                    img.style.maxHeight = '250px';
+                    img.style.objectFit = 'contain';
+
+                    img.onerror = (e) => {
+                        console.error('❌ Image load error:', e);
+                        console.error('  src:', img.src?.substring(0, 50) + '...');
+                    };
+
+                    img.onload = () => {
+                        console.log('✅ Image loaded:', img.naturalWidth, 'x', img.naturalHeight);
+                    };
+
+                    img.src = previewObjectURL;
+                    console.log('  img.src set');
+
+                    previewContainer.appendChild(img);
+                    console.log('  Image appended to previewContainer');
+                    console.log('  previewContainer children:', previewContainer.children.length);
+
+                } else if (isVideo) {
+                    console.log('🎬 Creating video preview...');
+                    const video = document.createElement('video');
+                    video.src = previewObjectURL;
+                    video.controls = true;
+                    video.style.maxWidth = '100%';
+                    video.style.maxHeight = '250px';
+                    previewContainer.appendChild(video);
+                    console.log('  Video appended');
+
+                } else if (isAudio) {
+                    console.log('🎵 Creating audio preview...');
+                    const audio = document.createElement('audio');
+                    audio.src = previewObjectURL;
+                    audio.controls = true;
+                    audio.style.width = '100%';
+                    previewContainer.appendChild(audio);
+                    console.log('  Audio appended');
+
+                } else {
+                    console.log('📄 Creating file icon...');
+                    const icon = document.createElement('div');
+                    icon.className = 'file-icon-large';
+                    icon.textContent = getFileIcon(file.type) || '📄';
+                    icon.style.fontSize = '64px';
+                    icon.style.padding = '20px';
+                    previewContainer.appendChild(icon);
+                    console.log('  Icon appended');
+                }
+            } catch (err) {
+                console.error('❌ Error creating preview:', err);
+                alert('Ошибка создания превью: ' + err.message);
+            }
+
+            console.log('🔧 [5/6] Setting up handlers');
+
+            const closeModal = () => {
+                console.log('🚪 Closing modal');
+                modal.classList.add('hidden');
+                if (previewObjectURL) {
+                    URL.revokeObjectURL(previewObjectURL);
+                    previewObjectURL = null;
+                }
+                pendingFile = null;
+                pendingFileTarget = null;
+                document.removeEventListener('keydown', handleKeydown);
+            };
+
+            const handleKeydown = (e) => {
+                if (e.key === 'Escape') {
+                    console.log('⌨️ Escape pressed');
+                    closeModal();
+                }
+            };
+
+            const handleSend = async () => {
+                console.log('📤 [SEND] Button clicked');
+
+                // Сохраняем данные ДО закрытия модалки
+                const uploadFile = pendingFile;
+                const toUser = pendingFileTarget;
+
+                // Закрываем модалку (она обнуляет pendingFile)
+                closeModal();
+
+                if (!uploadFile) {
+                    console.error('❌ No pending file');
+                    resolve();
+                    return;
+                }
+
+                console.log('📤 Uploading:', { name: uploadFile.name, size: uploadFile.size, to: toUser });
+
+                const formData = new FormData();
+                formData.append('file', uploadFile);
+                formData.append('to_user', toUser);
+                formData.append('user_id', myId);
+
+                try {
+                    console.log('🌐 Fetch start');
+                    const resp = await fetch('/api/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    console.log('🌐 Response status:', resp.status);
+
+                    const data = await resp.json();
+                    console.log('🌐 Response data:', data);
+
+                    if (!resp.ok) throw new Error(data.error || 'Upload failed');
+
+                    const mediaType = MEDIA_TYPES.includes(uploadFile.type) ? 'media' : 'file';
+                    const msg = {
+                        type: 'chat',
+                        to: toUser,
+                        payload: data.url,
+                        mediaType: mediaType,
+                        fileName: data.fileName || uploadFile.name,
+                        fileSize: data.fileSize || uploadFile.size,
+                        mimeType: data.mimeType || uploadFile.type
+                    };
+
+                    console.log('📡 Sending WS message');
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify(msg));
+                        console.log('✅ WS message sent');
+                    } else {
+                        console.error('❌ WebSocket not ready:', ws?.readyState);
+                    }
+
+                    renderFileMessage(myId, toUser, data.url, mediaType,
+                        data.fileName || uploadFile.name,
+                        data.fileSize || uploadFile.size,
+                        data.mimeType || uploadFile.type);
+                    console.log('✅ File rendered in chat');
+                    resolve();
+                } catch (err) {
+                    console.error('❌ Upload error:', err);
+                    alert('Ошибка загрузки: ' + err.message);
+                    resolve();
+                }
+            };
+
+            sendBtn.onclick = handleSend;
+            cancelBtn.onclick = closeModal;
+
+            modal.onclick = (e) => {
+                if (e.target === modal) {
+                    console.log('🖱️ Clicked outside modal');
+                    closeModal();
+                }
+            };
+
+            document.addEventListener('keydown', handleKeydown);
+
+            modal.classList.remove('hidden');
+            console.log('✅ [6/6] Modal shown');
+
+            setTimeout(() => {
+                const style = window.getComputedStyle(modal);
+                console.log('🎨 Modal visibility:', {
+                    display: style.display,
+                    visibility: style.visibility,
+                    opacity: style.opacity
+                });
+            }, 100);
+
+        } catch (err) {
+            console.error('💥 showFileConfirmModal error:', err);
+            alert('Ошибка показа превью: ' + err.message);
+            resolve();
+        }
+    });
+}
+
+function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeType) {
+    const tokenParam = '?token=' + encodeURIComponent(myId);
+
+    const ext = fileName?.split('.').pop()?.toLowerCase() || '';
+    const mime = mimeType?.toLowerCase() || '';
+    const urlExt = url?.split('.').pop()?.toLowerCase() || '';
+
+    const isImage = mime.startsWith('image/') ||
+        ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext) ||
+        ['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(urlExt);
+    const isVideo = mime.startsWith('video/') ||
+        ['mp4', 'webm', 'mov', 'avi'].includes(ext) ||
+        ['mp4', 'webm', 'mov'].includes(urlExt);
+    const isAudio = mime.startsWith('audio/') ||
+        ['mp3', 'wav', 'ogg', 'm4a'].includes(ext) ||
+        ['mp3', 'wav', 'ogg'].includes(urlExt);
+
+    const isMediaFallback = mediaType === 'media' &&
+        (['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'webm', 'mov'].includes(urlExt) ||
+         url?.includes('/api/file/'));
+
+    console.log('🎨 Проверка:', { ext, mime, urlExt, isImage, isVideo, isAudio, isMediaFallback, mediaType });
+    console.log('🎨 Рендер файла:', { url, mediaType, mimeType, fileName, ext, isImage, isVideo, isAudio });
+
+    const div = document.createElement('div');
+    div.className = `msg ${from === myId ? 'mine' : ''}`;
+
+    const nameEl = document.createElement('strong');
+    nameEl.textContent = from === myId ? 'Вы' : from;
+    nameEl.style.display = 'block';
+    nameEl.style.fontSize = '0.7rem';
+    nameEl.style.opacity = '0.8';
+    nameEl.style.marginBottom = '4px';
+    div.appendChild(nameEl);
+
+    const content = document.createElement('div');
+    const isMediaType = mediaType === 'media' || isMediaFallback || isImage || isVideo || isAudio;
+    content.className = isMediaType ? 'msg-media' : 'msg-file';
+
+    if (isImage || (isMediaFallback && urlExt && ['png','jpg','jpeg','gif','webp'].includes(urlExt))) {
+        const img = document.createElement('img');
+        img.src = url + tokenParam;
+        img.loading = 'lazy';
+        img.onerror = () => { console.error('Ошибка загрузки изображения:', url); img.alt = '❌'; };
+        img.onclick = () => openMediaViewer(url + tokenParam, 'image');
+        img.style.cursor = 'pointer';
+        content.appendChild(img);
+    } else if (isVideo) {
+        const video = document.createElement('video');
+        video.src = url + tokenParam;
+        video.controls = true;
+        video.preload = 'metadata';
+        video.onclick = () => openMediaViewer(url + tokenParam, 'video');
+        video.style.cursor = 'pointer';
+        content.appendChild(video);
+    } else if (isAudio) {
+        const audio = document.createElement('audio');
+        audio.src = url + tokenParam;
+        audio.controls = true;
+        audio.preload = 'none';
+        content.appendChild(audio);
+    } else {
+        const icon = document.createElement('span');
+        icon.className = 'file-icon';
+        icon.textContent = getFileIcon(mimeType);
+        content.appendChild(icon);
+
+        const info = document.createElement('div');
+        info.className = 'file-info';
+
+        const fnameEl = document.createElement('div');
+        fnameEl.className = 'file-name';
+        fnameEl.textContent = fileName;
+        fnameEl.title = fileName;
+        info.appendChild(fnameEl);
+
+        const sizeEl = document.createElement('div');
+        sizeEl.className = 'file-size';
+        sizeEl.textContent = fileSize ? formatBytes(fileSize) : 'unknown';
+        info.appendChild(sizeEl);
+
+        content.appendChild(info);
+
+        const btn = document.createElement('a');
+        btn.className = 'download-btn';
+        btn.href = url + tokenParam;
+        btn.download = fileName;
+        btn.textContent = 'Скачать';
+        content.appendChild(btn);
+    }
+
+    div.appendChild(content);
+    chatEl.appendChild(div);
+    chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 // Буфер для хранения сообщений по диалогам (ключ = dialogKey)
 const messageBuffers = {};
 
@@ -366,14 +766,15 @@ function getDialogKey(id1, id2) {
  * @param {string} from - Отправитель сообщения
  * @param {string} to - Получатель сообщения
  * @param {string} payload - Содержимое сообщения (текст или base64)
- * @param {'text'|'voice'|'video'} type - Тип сообщения
+ * @param {'text'|'voice'|'video'|'file'|'media'} type - Тип сообщения
+ * @param {object} extra - Дополнительные данные (fileName, fileSize, mimeType)
  */
-function bufferMessage(dialogKey, from, to, payload, type) {
+function bufferMessage(dialogKey, from, to, payload, type, extra = {}) {
     if (!messageBuffers[dialogKey]) {
         messageBuffers[dialogKey] = [];
     }
-    messageBuffers[dialogKey].push({ from, to, payload, type });
-    
+    messageBuffers[dialogKey].push({ from, to, payload, type, ...extra });
+
     // Защита от спама: удаляем старые сообщения, если буфер превысил лимит
     if (messageBuffers[dialogKey].length > DIALOG_BUFFER_LIMIT) {
         messageBuffers[dialogKey] = messageBuffers[dialogKey].slice(-DIALOG_BUFFER_LIMIT);
@@ -611,15 +1012,28 @@ function renderContactList() {
             if (serverMessages.length > 0) {
                 console.log(`📤 Рендеринг ${serverMessages.length} сообщений из истории сервера`);
                 serverMessages.forEach(msg => {
-                    // Рендерим напрямую через renderMessageElement
-                    renderMessageElement(msg.from, msg.payload, msg.mediaType);
+                    if (!msg) return;
+                    const toUser = msg.to || id;
+                    if (msg.mediaType === 'file' || msg.mediaType === 'media') {
+                        renderFileMessage(msg.from, toUser, msg.payload, msg.mediaType,
+                            msg.fileName, msg.fileSize, msg.mimeType);
+                    } else {
+                        renderMessageElement(msg.from, msg.payload, msg.mediaType || msg.type || 'text');
+                    }
                 });
             } else {
                 // Если серверная история пуста, показываем локальный буфер (как резерв)
                 const bufferedMessages = messageBuffers[newDialogKey] || [];
                 console.log(`📤 Загружено ${bufferedMessages.length} сообщений из локального буфера`);
                 bufferedMessages.forEach(msg => {
-                    renderMessageElement(msg.from, msg.payload, msg.type);
+                    if (!msg) return;
+                    const toUser = msg.to || id;
+                    if (msg.type === 'file' || msg.type === 'media') {
+                        renderFileMessage(msg.from, toUser, msg.payload, msg.type,
+                            msg.fileName, msg.fileSize, msg.mimeType);
+                    } else {
+                        renderMessageElement(msg.from, msg.payload, msg.type || 'text');
+                    }
                 });
                 delete messageBuffers[newDialogKey];
             }
@@ -661,7 +1075,7 @@ function renderContactList() {
  * @param {'text'|'voice'|'video'} type - Тип сообщения
  * @returns {void}
  */
-function displayMessage(from, to, payload, type = 'text') {
+function displayMessage(from, to, payload, type = 'text', extra = {}) {
     // Всегда определяем dialogKey для сообщения
     // Если to отсутствует — используем myId как второй участник
     const dialogKey = to ? getDialogKey(from, to) : getDialogKey(myId, from);
@@ -672,12 +1086,12 @@ function displayMessage(from, to, payload, type = 'text') {
         
         if (dialogKey === currentDialogKey) {
             console.log(`📨 [${dialogKey}] от ${from} к ${to}: показано (текущий диалог)`);
-            return renderMessageElement(from, payload, type);
+            if (type === 'file' || type === 'media') { return renderFileMessage(from, to, payload, type, extra.fileName, extra.fileSize, extra.mimeType); } return renderMessageElement(from, payload, type);
         }
     }
     
     // Во всех остальных случаях — буферизируем
-    bufferMessage(dialogKey, from, to, payload, type);
+    bufferMessage(dialogKey, from, to, payload, type, extra);
     console.log(`📨 [${dialogKey}] от ${from} к ${to}: забуферизировано`);
 }
 
@@ -836,13 +1250,24 @@ msgInput.addEventListener('input', () => {
     autoResizeTextarea();
 });
 
+const isMobile = typeof window !== 'undefined' && (
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+    window.matchMedia("(pointer: coarse)").matches ||
+    window.innerWidth <= 768
+);
+
+if (isMobile) {
+    msgInput.placeholder = 'Напишите что-нибудь...\nНажмите Enter для новой строки';
+}
+
 msgInput.addEventListener('keydown', (e) => {
-    // Ctrl+Enter или Cmd+Enter (Mac) = отправить
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    if (isMobile) {
+        return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
     }
-    // Enter или Shift+Enter = новая строка (дефолтное поведение textarea)
 });
 
 const sendBtn = document.getElementById('sendBtn');
@@ -852,3 +1277,50 @@ if (sendBtn) {
 
 // Инициализация textarea при загрузке
 autoResizeTextarea();
+
+// Media Viewer (Lightbox)
+function openMediaViewer(url, type) {
+    const viewer = document.getElementById('media-viewer');
+    const content = document.getElementById('media-viewer-content');
+    if (!viewer || !content) return;
+
+    content.innerHTML = '';
+
+    if (type === 'image') {
+        const img = document.createElement('img');
+        img.src = url;
+        img.alt = 'Full size';
+        content.appendChild(img);
+    } else if (type === 'video') {
+        const video = document.createElement('video');
+        video.src = url;
+        video.controls = true;
+        video.autoplay = true;
+        content.appendChild(video);
+    }
+
+    viewer.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+}
+
+function closeMediaViewer(event) {
+    if (event && event.target !== event.currentTarget && event.target.className !== 'close-viewer') {
+        return;
+    }
+
+    const viewer = document.getElementById('media-viewer');
+    const content = document.getElementById('media-viewer-content');
+    if (viewer) viewer.classList.add('hidden');
+    if (content) content.innerHTML = '';
+    document.body.style.overflow = '';
+}
+
+// Close media viewer on Escape
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const viewer = document.getElementById('media-viewer');
+        if (viewer && !viewer.classList.contains('hidden')) {
+            closeMediaViewer();
+        }
+    }
+});
