@@ -2,7 +2,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const body = document.body;
     const themeBtn = document.getElementById("theme-toggle");
     const container = document.querySelector(".app-container");
-    const backBtn = document.getElementById("mobile-back");
+    const backBtn = document.getElementById("back-to-contacts");
+    const closeBtn = document.getElementById("close-chat");
     const msgInput = document.getElementById("msgInput");
     const sendBtn = document.getElementById("sendBtn");
     const recordBtn = document.getElementById("recordBtn");
@@ -25,6 +26,8 @@ document.addEventListener("DOMContentLoaded", () => {
     updateThemeIcon(body.classList.contains("dark-theme"));
 
     // --- Мобильная навигация ---
+    const isMobile = () => window.innerWidth <= 768;
+
     window.ui = {
         openChat: (id) => {
             container.classList.add("chat-open");
@@ -34,10 +37,35 @@ document.addEventListener("DOMContentLoaded", () => {
         },
         closeChat: () => {
             container.classList.remove("chat-open");
+            document.getElementById("chat-view").classList.add("hidden");
+            document.getElementById("welcome-screen").classList.remove("hidden");
+            document.querySelectorAll("#contactList li").forEach(el => el.classList.remove("active"));
+            if (typeof targetPeer !== "undefined") {
+                targetPeer = null;
+            }
         }
     };
 
-    backBtn.addEventListener("click", () => window.ui.closeChat());
+    // Back button - mobile only (prevent browser history)
+    backBtn?.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.ui.closeChat();
+    });
+
+    // Close button - works on both mobile and desktop
+    closeBtn?.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.ui.closeChat();
+    });
+
+    // ESC key - close chat on desktop
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && container.classList.contains("chat-open")) {
+            window.ui.closeChat();
+        }
+    });
 
     // --- Кнопки ввода ---
     msgInput.addEventListener("input", () => {
