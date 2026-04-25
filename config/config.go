@@ -11,9 +11,9 @@ import (
 
 // Config holds application configuration loaded from environment variables.
 type Config struct {
-	Port             string
-	AllowedOrigins   []string
-	FileStoragePath   string `env:"FILE_STORAGE_PATH" default:"./uploads"`
+	Port            string
+	AllowedOrigins  []string
+	FileStoragePath string `env:"FILE_STORAGE_PATH" default:"./uploads"`
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -36,7 +36,7 @@ func Load() Config {
 
 	return Config{
 		Port:            port,
-		AllowedOrigins: allowedOrigins,
+		AllowedOrigins:  allowedOrigins,
 		FileStoragePath: fileStoragePath,
 	}
 }

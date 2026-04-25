@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,29 +35,36 @@ type Peer struct {
 }
 
 type Message struct {
-	Type      string `json:"type"`
-	From     string `json:"from"`
-	To       string `json:"to"`
-	Payload  any    `json:"payload"`
-	MediaType string `json:"mediaType"`
-	FileName string `json:"fileName,omitempty"`
-	FileSize int64  `json:"fileSize,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
+	Type         string   `json:"type"`
+	ID           int64    `json:"id,omitempty"`
+	From         string   `json:"from"`
+	To           string   `json:"to"`
+	Payload      any      `json:"payload"`
+	MediaType    string   `json:"mediaType"`
+	FileName     string   `json:"fileName,omitempty"`
+	FileSize    int64    `json:"fileSize,omitempty"`
+	MimeType    string   `json:"mimeType,omitempty"`
+	ReplyToUser string   `json:"replyToUser,omitempty"`
+	ReplyToText string   `json:"replyToText,omitempty"`
+	IsRead     bool     `json:"isRead,omitempty"`
+	MessageIDs []int64 `json:"messageIds,omitempty"`
 }
 
 type Server struct {
-	peers            map[string]*Peer
-	mu               sync.RWMutex
-	db               *sql.DB
-	upgrader         websocket.Upgrader
-	lastUserRequest  map[string]time.Time
-	fileStoragePath  string
+	peers           map[string]*Peer
+	mu              sync.RWMutex
+	db              *sql.DB
+	upgrader        websocket.Upgrader
+	lastUserRequest map[string]time.Time
+	fileStoragePath string
+	tokens          map[string]string
 }
 
 func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB) *Server {
 	return &Server{
-		peers: make(map[string]*Peer),
-		db:    db,
+		peers:  make(map[string]*Peer),
+		db:     db,
+		tokens: make(map[string]string),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				origin := r.Header.Get("Origin")
@@ -70,44 +79,38 @@ func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB)
 	}
 }
 
-func (s *Server) saveMessage(msg Message) {
+func (s *Server) saveMessage(msg Message) int64 {
 	payloadStr, ok := msg.Payload.(string)
 	if !ok {
 		log.Printf("🔧 Message payload is not string: %T", msg.Payload)
-		return
+		return 0
 	}
 
 	const maxPayloadSize = 1 * 1024 * 1024
 	if len(payloadStr) > maxPayloadSize {
 		log.Printf("⚠️ Payload too large: %d bytes from %s, limit: %d", len(payloadStr), msg.From, maxPayloadSize)
-		return
+		return 0
 	}
 
-	var fileName, mimeType string
-	var fileSize int64
+	replyToUser := msg.ReplyToUser
+	replyToText := msg.ReplyToText
 
-	if msg.MediaType == "file" || msg.MediaType == "media" {
-		fileName = msg.FileName
-		fileSize = msg.FileSize
-		mimeType = msg.MimeType
-
-		if fileName == "" && strings.HasPrefix(payloadStr, "/api/file/") {
-			fileUUID := strings.TrimPrefix(payloadStr, "/api/file/")
-			s.db.QueryRow(
-				"SELECT file_name, file_size, mime_type FROM file_uploads WHERE file_uuid = ?",
-				fileUUID,
-			).Scan(&fileName, &fileSize, &mimeType)
-		}
-	}
-
-	_, err := s.db.Exec(
-		`INSERT INTO messages (from_user, to_user, payload, media_type, file_name, file_size, mime_type)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		msg.From, msg.To, payloadStr, msg.MediaType, fileName, fileSize, mimeType,
+	result, err := s.db.Exec(
+		`INSERT INTO messages (from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		msg.From, msg.To, payloadStr, msg.MediaType, msg.FileName, msg.FileSize, msg.MimeType, replyToUser, replyToText,
 	)
 	if err != nil {
 		log.Println("❌ Ошибка сохранения в БД:", err)
+		return 0
 	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		log.Printf("🔧 Failed to get last insert ID: %v", err)
+		return 0
+	}
+	return id
 }
 
 // Handle user registration
@@ -206,16 +209,38 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := map[string]string{"username": req.Username}
+	token := generateToken()
+	s.mu.Lock()
+	s.tokens[token] = req.Username
+	s.mu.Unlock()
+
+	resp := map[string]string{"username": req.Username, "token": token}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
+func generateToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 // isRateLimited проверяет и обновляет время последнего запроса от IP.
 // Возвращает true, если запрос должен быть отклонён.
+// Очищает старые записи старше 1 минуты для предотвращения утечки памяти.
 func (s *Server) isRateLimited(ip string) bool {
 	if s.lastUserRequest == nil {
 		s.lastUserRequest = make(map[string]time.Time)
+	}
+
+	// Очистка старых записей each 100 requests to prevent memory leak
+	if len(s.lastUserRequest) > 0 && len(s.lastUserRequest)%100 == 0 {
+		cutoff := time.Now().Add(-1 * time.Minute)
+		for k, v := range s.lastUserRequest {
+			if v.Before(cutoff) {
+				delete(s.lastUserRequest, k)
+			}
+		}
 	}
 
 	lastRequest, exists := s.lastUserRequest[ip]
@@ -225,6 +250,16 @@ func (s *Server) isRateLimited(ip string) bool {
 
 	s.lastUserRequest[ip] = time.Now()
 	return false
+}
+
+func (s *Server) getUserFromToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	username, ok := s.tokens[token]
+	return username, ok
 }
 
 // Handle get all users (for contacts list) with simple rate limiting
@@ -287,9 +322,37 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
+		username = ""
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	
+	unreadMap := make(map[string]int)
+	if username != "" {
+		rows, err := s.db.Query("SELECT from_user, COUNT(*) FROM messages WHERE to_user = ? AND is_read = 0 GROUP BY from_user", username)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var sender string
+				var count int
+				if err := rows.Scan(&sender, &count); err == nil {
+					unreadMap[sender] = count
+				}
+			}
+		}
+	}
+	
+	log.Printf("📬 handleGetUsers: user=%s, unreadMap=%v", username, unreadMap)
+	
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"users": usernames,
+		"unread": unreadMap,
 	})
 }
 
@@ -306,18 +369,22 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.Header.Get("X-User-ID")
-	if userID == "" {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	rows, err := s.db.Query(
-		`SELECT from_user, to_user, payload, media_type, file_name, file_size, mime_type
+		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read
 		 FROM messages
 		 WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
 		 ORDER BY id ASC LIMIT 50`,
-		userID, targetUser, targetUser, userID,
+		username, targetUser, targetUser, username,
 	)
 	if err != nil {
 		log.Printf("❌ Failed to query history: %v", err)
@@ -327,20 +394,24 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	var messages []map[string]interface{}
+	var id int64
 	for rows.Next() {
 		var from, to, payload, mediaType string
-		var fileName, mimeType sql.NullString
+		var fileName, mimeType, replyToUser, replyToPayload sql.NullString
 		var fileSize int64
-		if err := rows.Scan(&from, &to, &payload, &mediaType, &fileName, &fileSize, &mimeType); err != nil {
+		var isRead int
+		if err := rows.Scan(&id, &from, &to, &payload, &mediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead); err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
 		}
 		msg := map[string]interface{}{
+			"id":        id,
 			"from":      from,
 			"to":        to,
 			"payload":   payload,
 			"mediaType": mediaType,
 			"type":      "chat",
+			"isRead":    isRead == 1,
 		}
 		if fileName.Valid {
 			msg["fileName"] = fileName.String
@@ -350,6 +421,12 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		if mimeType.Valid {
 			msg["mimeType"] = mimeType.String
+		}
+		if replyToUser.Valid {
+			msg["replyToUser"] = replyToUser.String
+		}
+		if replyToPayload.Valid {
+			msg["replyToText"] = replyToPayload.String
 		}
 		messages = append(messages, msg)
 	}
@@ -374,14 +451,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.FormValue("user_id")
-	if userID == "" {
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	toUser := r.FormValue("to_user")
-	log.Printf("📥 handleUpload: user=%s, to=%s", userID, toUser)
+	log.Printf("📥 handleUpload: user=%s, to=%s", username, toUser)
 	if toUser == "" {
 		http.Error(w, "missing to_user", http.StatusBadRequest)
 		return
@@ -441,7 +522,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	_, err = s.db.Exec(
 		`INSERT INTO file_uploads (from_user, to_user, file_uuid, file_path, file_name, file_size, mime_type, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		userID, toUser, fileUUID, filePath, header.Filename, fileSize, mimeType, expiresAtStr,
+		username, toUser, fileUUID, filePath, header.Filename, fileSize, mimeType, expiresAtStr,
 	)
 	if err != nil {
 		log.Printf("❌ Ошибка сохранения в БД: %v", err)
@@ -457,7 +538,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"file_id":   fileID,
+		"file_id":  fileID,
 		"url":      "/api/file/" + fileUUID,
 		"fileName": header.Filename,
 		"fileSize": fileSize,
@@ -471,18 +552,33 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := r.Header.Get("X-User-ID")
-	if userID == "" {
-		userID = r.URL.Query().Get("token")
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
 	}
-	if userID == "" {
+	// Fallback: try query param if header is empty (for img/video tags)
+	if auth == "" {
+		auth = r.URL.Query().Get("token")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	fileUUID := strings.TrimPrefix(r.URL.Path, "/api/file/")
-	if fileUUID == "" {
+	// Правильное получение UUID через strings.Split
+	path := r.URL.Path
+	parts := strings.Split(path, "/api/file/")
+	if len(parts) < 2 || parts[1] == "" {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	fileUUID := parts[1]
+
+	// Валидация через uuid.Parse для защиты от Path Traversal
+	if _, err := uuid.Parse(fileUUID); err != nil {
+		log.Printf("⚠️ Invalid file UUID: %s", fileUUID)
+		http.Error(w, "invalid file id", http.StatusBadRequest)
 		return
 	}
 
@@ -512,7 +608,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if userID != fromUser && userID != toUser {
+	if username != fromUser && username != toUser {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -592,7 +688,7 @@ func (s *Server) cleanupExpiredFiles() {
 
 func (s *Server) sendHistory(p *Peer) {
 	rows, err := s.db.Query(
-		`SELECT from_user, to_user, payload, media_type, file_name, file_size, mime_type FROM messages
+		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read FROM messages
 		 WHERE from_user = ? OR to_user = ?
 		 ORDER BY id ASC LIMIT 50`,
 		p.ID, p.ID,
@@ -606,9 +702,10 @@ func (s *Server) sendHistory(p *Peer) {
 	for rows.Next() {
 		var msg Message
 		var payloadStr string
-		var fileName, mimeType sql.NullString
+		var fileName, mimeType, replyToUser, replyToPayload sql.NullString
 		var fileSize int64
-		err := rows.Scan(&msg.From, &msg.To, &payloadStr, &msg.MediaType, &fileName, &fileSize, &mimeType)
+		var isRead int
+		err := rows.Scan(&msg.ID, &msg.From, &msg.To, &payloadStr, &msg.MediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead)
 		if err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
@@ -622,7 +719,14 @@ func (s *Server) sendHistory(p *Peer) {
 		if mimeType.Valid {
 			msg.MimeType = mimeType.String
 		}
+		if replyToUser.Valid {
+			msg.ReplyToUser = replyToUser.String
+		}
+		if replyToPayload.Valid {
+			msg.ReplyToText = replyToPayload.String
+		}
 		msg.FileSize = fileSize
+		msg.IsRead = isRead == 1
 
 		p.mu.Lock()
 		err = p.Conn.WriteJSON(msg)
@@ -666,9 +770,16 @@ func (s *Server) broadcastContacts() {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		http.Error(w, "missing user_id", http.StatusBadRequest)
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	if auth == "" {
+		auth = r.URL.Query().Get("token")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -678,6 +789,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set ReadLimit to 2MB to prevent DoS with huge packets
+	conn.SetReadLimit(2 << 20)
+
 	// Set up keep-alive with ping/pong
 	conn.SetPongHandler(func(appData string) error {
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -686,26 +800,31 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
 	// Handle connection - instant reconnect without delay
+	// Правильная очередность локов: сначала s.mu, потом peer.mu
 	s.mu.Lock()
-	existingPeer, exists := s.peers[userID]
+	var p *Peer
+	existingPeer, exists := s.peers[username]
 	var oldConn *websocket.Conn
 	if exists {
-		// Сохранить старое соединение для закрытия вне критической секции
+		// Лочим peer.mu перед изменением Conn
 		existingPeer.mu.Lock()
 		oldConn = existingPeer.Conn
 		existingPeer.Conn = conn
 		existingPeer.mu.Unlock()
 	} else {
 		// New peer
-		p := &Peer{ID: userID, Conn: conn}
-		s.peers[userID] = p
+		p = &Peer{ID: username, Conn: conn}
+		s.peers[username] = p
 	}
 	s.mu.Unlock()
 
-	// Закрыть старое соединение вне критической секции (не держать s.mu)
-	if oldConn != nil {
+	// Закрыть старое соединение вне критической секции (после разлочивания)
+	// Защитить Close() мьютексом existingPeer.mu
+	if oldConn != nil && existingPeer != nil {
+		existingPeer.mu.Lock()
 		oldConn.Close()
-		log.Printf("🔌 Закрыто старое соединение для пользователя %s", userID)
+		existingPeer.mu.Unlock()
+		log.Printf("🔌 Закрыто старое соединение для пользователя %s", username)
 	}
 
 	// Broadcast contacts and send history on every connection
@@ -713,11 +832,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	// Безопасно получить реальный *Peer из мапы
 	s.mu.RLock()
-	p, exists := s.peers[userID]
+	p, exists = s.peers[username]
 	s.mu.RUnlock()
 
 	if !exists {
-		log.Printf("⚠️ Peer %s не найден в мапе после регистрации, пропускаем отправку истории", userID)
+		log.Printf("⚠️ Peer %s не найден в мапе после регистрации, пропускаем отправку истории", username)
 	} else {
 		s.sendHistory(p)
 	}
@@ -736,11 +855,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			case <-ticker.C:
 				// Безопасно получить пира для доступа к защищённому соединению
 				s.mu.RLock()
-				p, exists := s.peers[userID]
+				p, exists := s.peers[username]
 				s.mu.RUnlock()
 
 				if !exists {
-					log.Printf("⚠️ Ping ticker: peer %s не найден, завершаем", userID)
+					log.Printf("⚠️ Ping ticker: peer %s не найден, завершаем", username)
 					return
 				}
 
@@ -749,7 +868,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				p.mu.Unlock()
 
 				if err != nil {
-					log.Printf("⚠️  Ping failed for %s: %v", userID, err)
+					log.Printf("⚠️  Ping failed for %s: %v", username, err)
 					return
 				}
 			case <-done:
@@ -759,14 +878,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	defer func() {
-		conn.Close()
+		if p != nil {
+			p.mu.Lock()
+			conn.Close()
+			p.mu.Unlock()
+		} else {
+			conn.Close()
+		}
 		s.mu.Lock()
-		peer, exists := s.peers[userID]
+		peer, exists := s.peers[username]
 		if exists && peer.Conn == conn {
-			delete(s.peers, userID)
+			delete(s.peers, username)
 			s.mu.Unlock()
 			s.broadcastContacts()
-			log.Printf("👤 Вышел: %s", userID)
+			log.Printf("👤 Вышел: %s", username)
 		} else {
 			s.mu.Unlock()
 		}
@@ -776,7 +901,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("⚠️  WebSocket closed unexpectedly for %s: %v", userID, err)
+				log.Printf("⚠️  WebSocket closed unexpectedly for %s: %v", username, err)
 			}
 			break
 		}
@@ -787,22 +912,20 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if len(preview) > 50 {
 				preview = preview[:50] + "..."
 			}
-			log.Printf("🔧 Failed to unmarshal message from %s: %v (raw: %q)", userID, err, preview)
+			log.Printf("🔧 Failed to unmarshal message from %s: %v (raw: %q)", username, err, preview)
 			continue
 		}
-		msg.From = userID
+		msg.From = username
 
 		if msg.Type == "chat" {
-			// Save message to persistent storage
-			s.saveMessage(msg)
+			newID := s.saveMessage(msg)
+			msg.ID = newID
 
-			// Check if recipient is online
 			s.mu.RLock()
 			target, ok := s.peers[msg.To]
 			s.mu.RUnlock()
 
 			if ok {
-				// Recipient is online - deliver via WebSocket
 				target.mu.Lock()
 				err := target.Conn.WriteJSON(msg)
 				if err != nil {
@@ -810,7 +933,69 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				target.mu.Unlock()
 			}
-			// If offline - message is saved, recipient will get it from history on next connect
+		}
+		
+		if msg.Type == "read_receipt" {
+			s.handleReadReceipt(msg.From, msg.MessageIDs)
+		}
+	}
+}
+
+func (s *Server) handleReadReceipt(from string, messageIDs []int64) {
+	log.Printf("📬 read_receipt from=%s, ids=%v", from, messageIDs)
+	
+	if len(messageIDs) == 0 {
+		return
+	}
+	
+	placeholders := make([]string, len(messageIDs))
+	args := make([]any, len(messageIDs))
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	
+	query := "UPDATE messages SET is_read = 1 WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+	result, err := s.db.Exec(query, args...)
+	if err != nil {
+		log.Printf("🔧 Failed to mark messages as read: %v", err)
+		return
+	}
+	
+	rowsAffected, _ := result.RowsAffected()
+	log.Printf("📬 Updated %d messages as read", rowsAffected)
+	
+	args = append([]any{from}, args...)
+	placeholders = make([]string, len(messageIDs))
+	for i := range messageIDs {
+		placeholders[i] = "?"
+	}
+	
+	rows, err := s.db.Query("SELECT id, from_user FROM messages WHERE from_user != ? AND id IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var msgID int64
+		var sender string
+		if err := rows.Scan(&msgID, &sender); err != nil {
+			continue
+		}
+		
+		s.mu.RLock()
+		peer, ok := s.peers[sender]
+		s.mu.RUnlock()
+		
+		if ok {
+			peer.mu.Lock()
+			peer.Conn.WriteJSON(Message{
+				Type:   "read_receipt",
+				ID:     msgID,
+				IsRead: true,
+			})
+			peer.mu.Unlock()
 		}
 	}
 }
@@ -840,9 +1025,32 @@ func initDB() *sql.DB {
 	}
 
 	// Добавить колонки если не существуют (миграция для существующей БД)
-	db.Exec("ALTER TABLE messages ADD COLUMN file_name TEXT;")
-	db.Exec("ALTER TABLE messages ADD COLUMN file_size INTEGER DEFAULT 0;")
-	db.Exec("ALTER TABLE messages ADD COLUMN mime_type TEXT;")
+	// Проверяем существование колонок через PRAGMA для идемпотентности
+	var count int
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='file_name'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN file_name TEXT;")
+	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='file_size'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN file_size INTEGER DEFAULT 0;")
+	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='mime_type'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN mime_type TEXT;")
+	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='reply_to_user'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN reply_to_user TEXT;")
+	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='reply_to_payload'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN reply_to_payload TEXT;")
+	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='is_read'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0;")
+	}
 
 	// Create users table for authentication
 	usersQuery := `
@@ -940,6 +1148,29 @@ func main() {
 	}()
 
 	http.HandleFunc("/ws", srv.handleWS)
+	
+	// Debug endpoint
+	http.HandleFunc("/debug/messages", func(w http.ResponseWriter, r *http.Request) {
+		user := r.URL.Query().Get("user")
+		if user == "" {
+			w.Write([]byte("Provide ?user=username"))
+			return
+		}
+		rows, err := srv.db.Query("SELECT id, from_user, to_user, is_read FROM messages WHERE to_user = ? OR from_user = ? ORDER BY id DESC LIMIT 20", user, user)
+		if err != nil {
+			w.Write([]byte(err.Error()))
+			return
+		}
+		defer rows.Close()
+		w.Write([]byte("ID | From | To | is_read\n"))
+		for rows.Next() {
+			var id, isRead int64
+			var from, to string
+			rows.Scan(&id, &from, &to, &isRead)
+			w.Write([]byte(fmt.Sprintf("%d | %s | %s | %d\n", id, from, to, isRead)))
+		}
+	})
+	
 	http.HandleFunc("/api/register", srv.handleRegister)
 	http.HandleFunc("/api/login", srv.handleLogin)
 	http.HandleFunc("/api/users", srv.handleGetUsers)

@@ -133,6 +133,7 @@ async function authenticateUser() {
                 
                 const data = await response.json();
                 localStorage.setItem('pear2p-username', data.username);
+                localStorage.setItem('pear2p-token', data.token || '');
                 
                 // Hide modal
                 modal.backdrop.style.display = 'none';
@@ -173,17 +174,26 @@ async function initializeApp() {
         await connectWebSocket();
         
         // Fetch all users for contact list
-        fetch('/api/users')
+        const token = localStorage.getItem('pear2p-token') || '';
+        fetch('/api/users', {
+            headers: { 'Authorization': 'Bearer ' + token }
+        })
             .then(r => r.json())
             .then(data => {
                 if (Array.isArray(data.users)) {
                     allUsers = data.users;
-                    // Optionally mark online users if they're already in the list
+                    console.log('📥 /api/users: unreadCounts=', data.unread);
+                    
+                    // Очищаем и обновляем (Вариант Б)
+                    Object.keys(unreadCounts).forEach(key => delete unreadCounts[key]);
+                    if (data.unread) {
+                        Object.assign(unreadCounts, data.unread);
+                    }
+                    
                     data.users.forEach(u => {
                         if (onlineUsers.has(u)) onlineUsers.add(u);
                     });
                     renderContactList();
-                    // adjustChatContainer(); // CSS flexbox handles layout
                 }
             })
             .catch(err => console.error('Failed to load users:', err));
@@ -212,8 +222,11 @@ function updateConnectionStatus(connected) {
 
 function connectWebSocket() {
     return new Promise((resolve, reject) => {
+        const token = localStorage.getItem('pear2p-token') || '';
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        window.ws = new WebSocket(`${protocol}//${location.host}/ws?user_id=${myId}`);
+        
+        // WebSocket не поддерживает кастомные заголовки, используем query param
+        window.ws = new WebSocket(`${protocol}//${location.host}/ws?token=${encodeURIComponent(token)}`);
         
         ws.onopen = () => {
             console.log('✅ WebSocket соединение установлено');
@@ -250,8 +263,32 @@ function connectWebSocket() {
                     renderContactList();
                 }
                 if (msg.type === "chat") {
-                    // Передаём: from, to, payload, mediaType
-                    displayMessage(msg.from, msg.to, msg.payload, msg.mediaType, { fileName: msg.fileName, fileSize: msg.fileSize, mimeType: msg.mimeType });
+                    displayMessage(msg.from, msg.to, msg.payload, msg.mediaType, {
+                        fileName: msg.fileName,
+                        fileSize: msg.fileSize,
+                        mimeType: msg.mimeType,
+                        id: msg.id,
+                        replyToUser: msg.replyToUser,
+                        replyToText: msg.replyToText,
+                        isRead: msg.isRead
+                    });
+                    
+                    if (msg.from !== myId && targetPeer !== msg.from) {
+                        unreadCounts[msg.from] = (unreadCounts[msg.from] || 0) + 1;
+                        renderContactList();
+                        playNotifySound();
+                    }
+                }
+                
+                if (msg.type === "read_receipt") {
+                    const msgEl = chatEl.querySelector(`.msg[data-id="${msg.id}"]`);
+                    if (msgEl) {
+                        const statusEl = msgEl.querySelector('.msg-status');
+                        if (statusEl) {
+                            statusEl.textContent = '✓✓';
+                            statusEl.classList.add('read');
+                        }
+                    }
                 }
             } catch (err) {
                 console.error('❌ Ошибка парсинга сообщения:', err, 'raw:', e.data);
@@ -272,6 +309,18 @@ function connectWebSocket() {
         ws.onclose = (event) => {
             console.log(`🔌 WebSocket соединение закрыто (code: ${event.code}, reason: ${event.reason})`);
             updateConnectionStatus(false);
+
+            // Очищаем токен при критических ошибках
+            if (event.code === 1006 || event.code === 4001) {
+                console.warn('⚠️ WS closed with critical code - clearing token');
+                localStorage.removeItem('pear2p-token');
+                localStorage.removeItem('pear2p-username');
+                // Показать модалку авторизации
+                authenticateUser().then(() => {
+                    connectWebSocket();
+                });
+                return;
+            }
             
             // Attempt to reconnect if we haven't exceeded max attempts
             if (reconnectAttempts < maxReconnectAttempts) {
@@ -294,8 +343,10 @@ initializeApp().catch(err => {
     alert('Не удалось запустить приложение. Перезагрузите страницу.');
 });
 let targetPeer = null;
+let lastNotificationTime = 0;
 let allUsers = [];
 const onlineUsers = new Set();
+const unreadCounts = {};
 
 let mediaMode = 'voice';
 let isRecording = false;
@@ -419,6 +470,7 @@ let previewObjectURL = null;
 
 function showFileConfirmModal(file, targetPeer) {
     return new Promise((resolve) => {
+        let cleanupNeeded = false;
         try {
             console.log('🔧 [1/6] showFileConfirmModal START');
 
@@ -467,6 +519,7 @@ function showFileConfirmModal(file, targetPeer) {
 
             try {
                 previewObjectURL = URL.createObjectURL(file);
+                cleanupNeeded = true;
                 console.log('🔗 ObjectURL created:', previewObjectURL?.substring(0, 50) + '...');
 
                 if (isImage) {
@@ -568,12 +621,15 @@ function showFileConfirmModal(file, targetPeer) {
                 const formData = new FormData();
                 formData.append('file', uploadFile);
                 formData.append('to_user', toUser);
-                formData.append('user_id', myId);
 
+                const token = localStorage.getItem('pear2p-token') || '';
                 try {
                     console.log('🌐 Fetch start');
                     const resp = await fetch('/api/upload', {
                         method: 'POST',
+                        headers: {
+                            'Authorization': 'Bearer ' + token
+                        },
                         body: formData
                     });
                     console.log('🌐 Response status:', resp.status);
@@ -641,14 +697,20 @@ function showFileConfirmModal(file, targetPeer) {
 
         } catch (err) {
             console.error('💥 showFileConfirmModal error:', err);
+            // Гарантированная очистка blob URL при ошибке
+            if (cleanupNeeded && previewObjectURL) {
+                try { URL.revokeObjectURL(previewObjectURL); } catch (e) {}
+                previewObjectURL = null;
+            }
             alert('Ошибка показа превью: ' + err.message);
             resolve();
         }
     });
 }
 
-function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeType) {
-    const tokenParam = '?token=' + encodeURIComponent(myId);
+function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeType, msgId, isRead) {
+    const token = localStorage.getItem('pear2p-token') || '';
+    const tokenParam = '?token=' + encodeURIComponent(token);
 
     const ext = fileName?.split('.').pop()?.toLowerCase() || '';
     const mime = mimeType?.toLowerCase() || '';
@@ -665,14 +727,18 @@ function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeTyp
         ['mp3', 'wav', 'ogg'].includes(urlExt);
 
     const isMediaFallback = mediaType === 'media' &&
-        (['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'webm', 'mov'].includes(urlExt) ||
-         url?.includes('/api/file/'));
-
-    console.log('🎨 Проверка:', { ext, mime, urlExt, isImage, isVideo, isAudio, isMediaFallback, mediaType });
-    console.log('🎨 Рендер файла:', { url, mediaType, mimeType, fileName, ext, isImage, isVideo, isAudio });
+    (['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'webm', 'mov'].includes(urlExt) ||
+     url?.includes('/api/file/'));
 
     const div = document.createElement('div');
     div.className = `msg ${from === myId ? 'mine' : ''}`;
+    if (msgId) {
+        div.dataset.id = msgId;
+    }
+    if (isRead !== undefined) {
+        div.dataset.isRead = isRead ? '1' : '0';
+    }
+    div.dataset.from = from;
 
     const nameEl = document.createElement('strong');
     nameEl.textContent = from === myId ? 'Вы' : from;
@@ -836,8 +902,19 @@ async function startRecording() {
         mediaRecorder.onstop = sendMedia;
         mediaRecorder.start();
     } catch (err) {
-        // Очищаем ресурсы даже если stream был получен до ошибки
+        // Очищаем ресурсы при ошибке
         cleanupRecord();
+        // Показываем уведомление пользователю
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+            console.error('❌ Доступ к микрофону/камере запрещён:', err);
+            showToast('Доступ запрещён. Разрешите в настройках браузера.');
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+            console.error('❌ Устройство не найдено:', err);
+            showToast('Микрофон/камера не найдены');
+        } else {
+            console.error('❌ Ошибка записи:', err);
+            showToast('Ошибка записи: ' + (err.message || err.name));
+        }
     }
 }
 
@@ -957,10 +1034,11 @@ function sendMedia() {
  * @returns {Promise<Array>} Массив сообщений
  */
 async function loadHistory(targetUser) {
+    const token = localStorage.getItem('pear2p-token') || '';
     try {
         const response = await fetch(`/api/history?with=${encodeURIComponent(targetUser)}`, {
             headers: {
-                'X-User-ID': myId
+                'Authorization': 'Bearer ' + token
             }
         });
         
@@ -979,6 +1057,7 @@ async function loadHistory(targetUser) {
 
 function renderContactList() {
     contactList.innerHTML = "";
+    console.log('🎨 renderContactList: unreadCounts=', unreadCounts);
     allUsers.forEach(id => {
         if (id === myId) return;
         const li = document.createElement("li");
@@ -987,27 +1066,34 @@ function renderContactList() {
         li.classList.add(onlineUsers.has(id) ? "online" : "offline");
         li.textContent = id;
         
+        const unreadEl = document.createElement("span");
+        unreadEl.className = "unread-count hidden";
+        const count = unreadCounts[id] || 0;
+        console.log('🎨 contact', id, 'unread count:', count);
+        if (count > 0) {
+            unreadEl.textContent = count;
+            unreadEl.classList.remove('hidden');
+        }
+        li.appendChild(unreadEl);
+        
         li.onclick = async () => {
-            // ✅ Правило 4: При смене диалога
-            // 1. Очистить чат
-            // 2. Загрузить историю с сервера (актуальная версия)
-            // 3. Установить targetPeer
-            
             const newDialogKey = getDialogKey(myId, id);
             console.log(`📁 Переключение на диалог: ${id} (key: ${newDialogKey})`);
-            console.log(`🗑️ Очистка чата, сообщений: ${chatEl.children.length}`);
             
             // Сбрасываем targetPeer перед установкой нового
             targetPeer = null;
-            
-            // Очищаем чат
-            chatEl.innerHTML = "";
-            
-            // Устанавливаем новый targetPeer
             targetPeer = id;
             
-            // Загружаем историю с сервера (актуальная версия)
+            // Сбрасываем счетчик непрочитанных
+            unreadCounts[id] = 0;
+            renderContactList();
+            
+            // Загружаем историю с сервера
             const serverMessages = await loadHistory(id);
+            
+            // Очищаем чат ПОСЛЕ получения ответа
+            chatEl.innerHTML = "";
+            console.log(`🗑️ Очистка чата, сообщений: ${chatEl.children.length}`);
             
             if (serverMessages.length > 0) {
                 console.log(`📤 Рендеринг ${serverMessages.length} сообщений из истории сервера`);
@@ -1016,9 +1102,14 @@ function renderContactList() {
                     const toUser = msg.to || id;
                     if (msg.mediaType === 'file' || msg.mediaType === 'media') {
                         renderFileMessage(msg.from, toUser, msg.payload, msg.mediaType,
-                            msg.fileName, msg.fileSize, msg.mimeType);
+                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead);
                     } else {
-                        renderMessageElement(msg.from, msg.payload, msg.mediaType || msg.type || 'text');
+                        renderMessageElement(msg.from, msg.payload, msg.mediaType || msg.type || 'text', {
+                            id: msg.id,
+                            replyToUser: msg.replyToUser,
+                            replyToText: msg.replyToText,
+                            isRead: msg.isRead
+                        });
                     }
                 });
             } else {
@@ -1030,13 +1121,38 @@ function renderContactList() {
                     const toUser = msg.to || id;
                     if (msg.type === 'file' || msg.type === 'media') {
                         renderFileMessage(msg.from, toUser, msg.payload, msg.type,
-                            msg.fileName, msg.fileSize, msg.mimeType);
+                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead);
                     } else {
-                        renderMessageElement(msg.from, msg.payload, msg.type || 'text');
+                        renderMessageElement(msg.from, msg.payload, msg.type || 'text', {
+                            id: msg.id,
+                            replyToUser: msg.replyToUser,
+                            replyToText: msg.replyToText,
+                            isRead: msg.isRead
+                        });
                     }
                 });
                 delete messageBuffers[newDialogKey];
             }
+            
+            const unreadMsgIDs = [];
+            chatEl.querySelectorAll('.msg').forEach(msgEl => {
+                if (msgEl.dataset.id) {
+                    const isIncoming = msgEl.dataset.from !== myId;
+                    if (isIncoming) {
+                        const isRead = msgEl.dataset.isRead === '1';
+                        if (!isRead) {
+                            unreadMsgIDs.push(parseInt(msgEl.dataset.id, 10));
+                        }
+                    }
+                }
+            });
+            if (unreadMsgIDs.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+                console.log('📤 Sending read_receipt for:', unreadMsgIDs);
+                ws.send(JSON.stringify({ type: "read_receipt", messageIds: unreadMsgIDs }));
+            }
+            
+            // Прокрутка вниз после отрисовки
+            chatEl.scrollTop = chatEl.scrollHeight;
             
             document.querySelectorAll("#contactList li").forEach(el => el.classList.remove("active"));
             li.classList.add("active");
@@ -1076,31 +1192,59 @@ function renderContactList() {
  * @returns {void}
  */
 function displayMessage(from, to, payload, type = 'text', extra = {}) {
-    // Всегда определяем dialogKey для сообщения
-    // Если to отсутствует — используем myId как второй участник
     const dialogKey = to ? getDialogKey(from, to) : getDialogKey(myId, from);
     
-    // Если targetPeer установлен и dialogKey совпадает — показываем сразу
     if (targetPeer) {
         const currentDialogKey = getDialogKey(myId, targetPeer);
         
         if (dialogKey === currentDialogKey) {
             console.log(`📨 [${dialogKey}] от ${from} к ${to}: показано (текущий диалог)`);
-            if (type === 'file' || type === 'media') { return renderFileMessage(from, to, payload, type, extra.fileName, extra.fileSize, extra.mimeType); } return renderMessageElement(from, payload, type);
+            if (type === 'file' || type === 'media') { return renderFileMessage(from, to, payload, type, extra.fileName, extra.fileSize, extra.mimeType, extra.id, extra.isRead); } 
+            return renderMessageElement(from, payload, type, extra);
         }
     }
     
-    // Во всех остальных случаях — буферизируем
     bufferMessage(dialogKey, from, to, payload, type, extra);
     console.log(`📨 [${dialogKey}] от ${from} к ${to}: забуферизировано`);
 }
 
 // Вынесённая функция рендеринга элемента сообщения (для переиспользования)
-function renderMessageElement(from, payload, type) {
+function renderMessageElement(from, payload, type, extra = {}) {
     const div = document.createElement("div");
     div.className = `msg ${from === myId ? 'mine' : ''}`;
+    if (extra.id) {
+        div.dataset.id = extra.id;
+    }
+    if (extra.isRead !== undefined) {
+        div.dataset.isRead = extra.isRead ? '1' : '0';
+    }
+    div.dataset.from = from;
     
     const displayName = from === myId ? "Вы" : from;
+    
+    // Reply quote - если есть данные об ответе
+    if (extra.replyToUser || extra.replyToText) {
+        const replyDiv = document.createElement("div");
+        replyDiv.className = "msg-reply";
+        
+        const replyAuthor = document.createElement("span");
+        replyAuthor.className = "msg-reply-author";
+        const replyAuthorName = extra.replyToUser === myId ? "Вы" : (extra.replyToUser || '');
+        replyAuthor.textContent = replyAuthorName;
+        replyDiv.appendChild(replyAuthor);
+        
+        const replyText = document.createElement("span");
+        replyText.className = "msg-reply-text";
+        // Truncate reply text
+        let replyTextContent = extra.replyToText || '';
+        if (replyTextContent.length > 50) {
+            replyTextContent = replyTextContent.substring(0, 50) + '...';
+        }
+        replyText.textContent = replyTextContent;
+        replyDiv.appendChild(replyText);
+        
+        div.appendChild(replyDiv);
+    }
     
     // Создаём имя безопасно — через textContent
     const nameEl = document.createElement("strong");
@@ -1120,12 +1264,15 @@ function renderMessageElement(from, payload, type) {
         div.appendChild(textEl);
         
     } else if (type === 'voice') {
-        // Base64 URL для audio src — безопасно, браузер сам экранирует
         const audio = document.createElement("audio");
         audio.src = payload;
         audio.controls = true;
         audio.style.maxWidth = "100%";
         audio.style.marginTop = "8px";
+        if (extra.id) {
+            audio.dataset.msgId = extra.id;
+            audio.addEventListener('play', () => sendReadReceipt(extra.id, extra.isRead));
+        }
         div.appendChild(audio);
         
     } else if (type === 'video') {
@@ -1136,13 +1283,25 @@ function renderMessageElement(from, payload, type) {
         video.playsInline = true;
         video.onclick = () => video.paused ? video.play() : video.pause();
         video.style.marginTop = "8px";
+        if (extra.id) {
+            video.dataset.msgId = extra.id;
+            video.addEventListener('play', () => sendReadReceipt(extra.id, extra.isRead));
+        }
         div.appendChild(video);
+    }
+    
+    if (from === myId) {
+        const statusEl = document.createElement("span");
+        statusEl.className = "msg-status";
+        statusEl.textContent = extra.isRead ? '✓✓' : '✓';
+        if (extra.isRead) {
+            statusEl.classList.add('read');
+        }
+        div.appendChild(statusEl);
     }
     
     chatEl.appendChild(div);
     chatEl.scrollTop = chatEl.scrollHeight;
-    
-    // adjustChatMessagesPadding(); // CSS flexbox handles layout
 }
 
 // function adjustChatMessagesPadding() {
@@ -1199,19 +1358,29 @@ const sendMessage = () => {
     const text = msgInput.value.trim();
     if (!text || !targetPeer) return;
     
+    const reply = getCurrentReply();
+    const baseMsg = {
+        type: "chat", 
+        to: targetPeer, 
+        payload: text, 
+        mediaType: 'text'
+    };
+    
+    if (reply) {
+        baseMsg.replyToUser = reply.author;
+        baseMsg.replyToText = reply.text;
+    }
+    
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-        // Ограничиваем размер очереди — удаляем старое если превышен лимит
         if (messageQueue.length >= MAX_MESSAGE_QUEUE) {
             const removed = messageQueue.shift();
             console.warn(`⚠️ Очередь заполнена, удалено сообщение: ${removed.substring(0, 50)}...`);
             showToast('Старые сообщения удалены из очереди');
         }
         
-        // Ставим в очередь для отправки при восстановлении соединения
-        const packet = JSON.stringify({ type: "chat", to: targetPeer, payload: text, mediaType: 'text' });
+        const packet = JSON.stringify(baseMsg);
         messageQueue.push(packet);
         
-        // Визуальный индикатор: показываем сообщение с пометкой ⏳
         const queuedEl = document.createElement("div");
         queuedEl.className = 'msg mine queued';
         queuedEl.innerHTML = `<span style="color: #888;">⏳ ${escapeHtml(text)}</span>`;
@@ -1219,24 +1388,22 @@ const sendMessage = () => {
         chatEl.appendChild(queuedEl);
         chatEl.scrollTop = chatEl.scrollHeight;
         
-        msgInput.value = "";
-        msgInput.dispatchEvent(new Event("input"));
-        
-        // Показываем тост
         showToast('Нет соединения — сообщение в очереди');
         console.warn('⚠️ WebSocket не готов, сообщение поставлено в очередь');
-        return;
+    } else {
+        try {
+            ws.send(JSON.stringify(baseMsg));
+        } catch (err) {
+            console.error('❌ Ошибка отправки:', err);
+        }
     }
     
-    try {
-        ws.send(JSON.stringify({ type: "chat", to: targetPeer, payload: text, mediaType: 'text' }));
-        // Передаём: from=myId, to=targetPeer
-        displayMessage(myId, targetPeer, text, 'text');
-        msgInput.value = "";
-        msgInput.dispatchEvent(new Event("input"));
-    } catch (err) {
-        console.error('❌ Ошибка отправки:', err);
-    }
+    displayMessage(myId, targetPeer, text, 'text', reply ? { replyToUser: reply.author, replyToText: reply.text } : {});
+    
+    hideReplyPreview();
+    msgInput.value = '';
+    msgInput.style.height = 'auto';
+    msgInput.dispatchEvent(new Event("input"));
 };
 
 // Авто-ресайз textarea при вводе
@@ -1322,5 +1489,299 @@ document.addEventListener('keydown', (e) => {
         if (viewer && !viewer.classList.contains('hidden')) {
             closeMediaViewer();
         }
+    }
+});
+
+// ============================================================================
+// Context Menu
+// ============================================================================
+const contextMenu = document.getElementById('context-menu');
+let selectedMessageEl = null;
+let touchTimer = null;
+
+function showContextMenu(x, y, msgEl) {
+    if (!contextMenu || !msgEl) return;
+
+    selectedMessageEl = msgEl;
+
+    // Позиционирование с учетом границ экрана
+    const menuWidth = 160;
+    const menuHeight = 180;
+    const padding = 10;
+
+    let adjustedX = x;
+    let adjustedY = y;
+
+    if (x + menuWidth > window.innerWidth - padding) {
+        adjustedX = window.innerWidth - menuWidth - padding;
+    }
+    if (y + menuHeight > window.innerHeight - padding) {
+        adjustedY = window.innerHeight - menuHeight - padding;
+    }
+
+    contextMenu.style.left = adjustedX + 'px';
+    contextMenu.style.top = adjustedY + 'px';
+    contextMenu.classList.remove('hidden');
+}
+
+function hideContextMenu() {
+    if (contextMenu) {
+        contextMenu.classList.add('hidden');
+    }
+    selectedMessageEl = null;
+}
+
+// Reply preview state
+let replyingTo = null; // { author: string, text: string, element: element }
+
+function showReplyPreview(author, text, msgEl) {
+    replyingTo = { author, text, element: msgEl };
+    
+    const preview = document.getElementById('reply-preview');
+    const authorEl = document.getElementById('reply-preview-author');
+    const textEl = document.getElementById('reply-preview-text');
+    
+    if (preview && authorEl && textEl) {
+        authorEl.textContent = author;
+        textEl.textContent = text;
+        preview.classList.remove('hidden');
+        preview.classList.add('active');
+    }
+    
+    // Focus input
+    msgInput?.focus();
+}
+
+const notifyAudio = new Audio('./sound.wav');
+notifyAudio.volume = 0.5;
+
+function sendReadReceipt(msgId, isAlreadyRead) {
+    if (!msgId || isAlreadyRead || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "read_receipt", messageIds: [msgId] }));
+}
+
+function playNotifySound() {
+    if (Date.now() - lastNotificationTime < 30000) {
+        return;
+    }
+    
+    notifyAudio.play().then(() => {
+        lastNotificationTime = Date.now();
+        console.log('🔔 Звуковое уведомление воспроизведено');
+    }).catch(err => {
+        console.warn('⚠️ Браузер заблокировал автовоспроизведение звука: первый клик по странице решит проблему');
+    });
+}
+
+function hideReplyPreview() {
+    replyingTo = null;
+    
+    const preview = document.getElementById('reply-preview');
+    if (preview) {
+        preview.classList.add('hidden');
+        preview.classList.remove('active');
+    }
+}
+
+function showTrollModal(messageText) {
+    const modal = document.getElementById('troll-modal');
+    const msgEl = document.getElementById('troll-message');
+    const okBtn = document.getElementById('troll-ok-btn');
+    
+    if (!modal || !msgEl || !okBtn) return;
+    
+    msgEl.textContent = messageText;
+    modal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    
+    const closeModal = () => {
+        modal.classList.add('hidden');
+        document.body.style.overflow = '';
+        okBtn.removeEventListener('click', closeModal);
+    };
+    
+    okBtn.addEventListener('click', closeModal);
+}
+
+function getReplyData(msgEl) {
+    const authorEl = msgEl.querySelector('.msg-reply-author, strong');
+    const textEl = msgEl.querySelector('.msg-reply-text');
+    const contentEl = msgEl.querySelector('span');
+    
+    const author = authorEl?.textContent || 'Unknown';
+    let text = textEl?.textContent || contentEl?.textContent || '';
+    
+    const id = msgEl.dataset.id ? parseInt(msgEl.dataset.id, 10) : null;
+    
+    if (text.length > 50) {
+        text = text.substring(0, 50) + '...';
+    }
+    
+    return { author, text, id };
+}
+
+// Cancel reply button
+document.getElementById('reply-cancel')?.addEventListener('click', () => {
+    hideReplyPreview();
+});
+
+// ============================================================================
+// Context Menu Actions
+// ============================================================================
+function handleContextAction(action) {
+    if (!selectedMessageEl) return;
+
+    const replyData = getReplyData(selectedMessageEl);
+
+    switch (action) {
+        case 'select':
+            selectedMessageEl.classList.toggle('selected');
+            showToast(selectedMessageEl.classList.contains('selected') ? 'Выделено' : 'Снято');
+            break;
+        case 'copy':
+            let textToCopy = '';
+            const imgEl = selectedMessageEl.querySelector('.msg-media img, .msg-file img');
+            const videoEl = selectedMessageEl.querySelector('.msg-media video');
+            const audioEl = selectedMessageEl.querySelector('.msg-media audio');
+            const linkEl = selectedMessageEl.querySelector('.download-btn');
+            const textEl = selectedMessageEl.querySelector('span:not(.msg-reply-author):not(.msg-reply-text)');
+            
+            if (imgEl) {
+                textToCopy = imgEl.src;
+            } else if (videoEl) {
+                textToCopy = videoEl.src;
+            } else if (audioEl) {
+                textToCopy = audioEl.src;
+            } else if (linkEl) {
+                textToCopy = linkEl.href;
+            } else if (textEl) {
+                textToCopy = textEl.textContent.trim();
+            }
+            
+            if (textToCopy) {
+                navigator.clipboard.writeText(textToCopy).then(() => {
+                    showToast('Скопировано в буфер');
+                }).catch(() => {
+                    showToast('Ошибка копирования');
+                });
+            } else {
+                showToast('Нечего копировать');
+            }
+            break;
+        case 'reply':
+            showReplyPreview(replyData.author, replyData.text, selectedMessageEl);
+            showToast('Ответить');
+            break;
+        case 'forward':
+            console.log('Forward message:', selectedMessageEl);
+            showToast('Переслать (TODO)');
+            break;
+        case 'delete':
+            showTrollModal('КУДА УДАЛЯТЬ СОБРАЛСЯ!');
+            break;
+        case 'edit':
+            showTrollModal('РЕДАЧЕР ХУЖЕ ПИДОРАСА!');
+            break;
+    }
+    
+    selectedMessageEl?.classList.remove('selected');
+    hideContextMenu();
+}
+
+// Get current reply for sending
+function getCurrentReply() {
+    if (!replyingTo) return null;
+    
+    const author = replyingTo.author === 'Вы' ? myId : replyingTo.author;
+    const text = replyingTo.text;
+    
+    return { author, text };
+}
+
+// Send message with reply data
+function sendMessageWithReply(text) {
+    const reply = getCurrentReply();
+    
+    const msg = {
+        type: 'chat',
+        to: targetPeer,
+        payload: text,
+        mediaType: 'text'
+    };
+    
+    if (reply) {
+        msg.replyToUser = reply.author;
+        msg.replyToText = reply.text;
+    }
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(msg));
+    }
+    
+    displayMessage(myId, targetPeer, text, 'text', reply ? { replyToUser: reply.author, replyToText: reply.text } : {});
+    
+    hideReplyPreview();
+    replyingTo = null;
+    msgInput.value = '';
+    msgInput.style.height = 'auto';
+}
+
+// Делегирование событий на chatEl для contextmenu (ПК)
+chatEl?.addEventListener('contextmenu', (e) => {
+    const msgEl = e.target.closest('.msg');
+    if (!msgEl) return;
+
+    e.preventDefault();
+    showContextMenu(e.clientX, e.clientY, msgEl);
+});
+
+// Делегирование событий на chatEl для longpress (мобильные)
+chatEl?.addEventListener('touchstart', (e) => {
+    const touch = e.touches[0];
+    const msgEl = document.elementFromPoint(touch.clientX, touch.clientY)?.closest('.msg');
+    if (!msgEl) return;
+
+    touchTimer = setTimeout(() => {
+        showContextMenu(touch.clientX, touch.clientY, msgEl);
+    }, 600);
+});
+
+chatEl?.addEventListener('touchend', () => {
+    if (touchTimer) {
+        clearTimeout(touchTimer);
+        touchTimer = null;
+    }
+});
+
+chatEl?.addEventListener('touchmove', () => {
+    if (touchTimer) {
+        clearTimeout(touchTimer);
+        touchTimer = null;
+    }
+});
+
+// Закрытие меню и снятие выделения при клике вне его
+document.addEventListener('click', (e) => {
+    const isContextMenu = contextMenu && contextMenu.contains(e.target);
+    const isContextItem = e.target.closest('.context-item');
+    const isReplyCancel = e.target.closest('#reply-cancel');
+    
+    if (contextMenu && !isContextMenu && !isContextItem) {
+        hideContextMenu();
+    }
+    
+    // Deselect all messages when clicking outside them
+    if (!e.target.closest('.msg') && !isContextItem && !isReplyCancel) {
+        chatEl?.querySelectorAll('.msg.selected').forEach(el => {
+            el.classList.remove('selected');
+        });
+    }
+});
+
+// Обработка кликов по пунктам меню
+contextMenu?.addEventListener('click', (e) => {
+    const item = e.target.closest('.context-item');
+    if (item) {
+        handleContextAction(item.dataset.action);
     }
 });

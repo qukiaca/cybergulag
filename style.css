@@ -816,3 +816,250 @@ body.dark-theme .action-btn img { filter: invert(1) brightness(0.9); }
         max-height: 200px;
     }
 }
+
+/* Context Menu */
+.context-menu {
+    position: fixed;
+    z-index: 2000;
+    background: var(--bg-surface);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 6px;
+    min-width: 160px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.context-item {
+    background: none;
+    border: none;
+    color: var(--text-main);
+    padding: 10px 14px;
+    text-align: left;
+    font-size: 0.9rem;
+    cursor: pointer;
+    border-radius: 8px;
+    transition: background 0.15s;
+}
+
+.context-item:hover {
+    background: var(--accent-soft);
+}
+
+.context-item:active {
+    background: var(--accent);
+    color: white;
+}
+
+.context-item[data-action="delete"]:hover {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+}
+
+.context-item[data-action="delete"]:active {
+    background: #ef4444;
+    color: white;
+}
+
+/* Selected message state */
+.msg.selected {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+.msg.mine.selected {
+    background: rgba(79, 70, 229, 0.2);
+}
+.msg:not(.mine).selected {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+/* Message status (checkmarks) */
+.msg-status {
+    font-size: 0.7rem;
+    opacity: 0.6;
+    align-self: flex-end;
+    margin-left: auto;
+    margin-top: 4px;
+}
+.msg-status.read {
+    color: var(--accent);
+    opacity: 1;
+}
+
+/* Unread counter in contact list */
+.unread-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: white;
+    background: var(--accent);
+    border-radius: 10px;
+    margin-left: auto;
+}
+.unread-count.hidden {
+    display: none;
+}
+
+/* Reply quote inside message */
+.msg-reply {
+    display: flex;
+    gap: 6px;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    border-radius: 6px;
+    border-left: 3px solid var(--accent);
+}
+.msg.mine .msg-reply {
+    background: rgba(255, 255, 255, 0.12);
+}
+.msg:not(.mine) .msg-reply {
+    background: rgba(0, 0, 0, 0.15);
+    border-left-color: var(--accent);
+}
+
+.msg-reply-author {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--accent);
+}
+
+.msg-reply-text {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 160px;
+}
+
+/* Reply preview above input */
+.reply-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg-surface);
+    border-radius: 10px;
+    margin-bottom: 8px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+.reply-preview.hidden {
+    display: none;
+}
+
+.reply-bar {
+    width: 3px;
+    height: 28px;
+    background: var(--accent);
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.reply-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+#reply-preview-author {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--accent);
+}
+
+#reply-preview-text {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#reply-cancel {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.4rem;
+    cursor: pointer;
+    padding: 4px 8px;
+    line-height: 1;
+    border-radius: 6px;
+    transition: all 0.15s ease;
+}
+
+#reply-cancel:hover {
+    color: var(--text-main);
+    background: var(--accent-soft);
+}
+
+/* Animation for reply preview */
+@keyframes slideUp {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+.reply-preview:not(.hidden) {
+    animation: slideUp 0.2s ease-out;
+}
+
+/* Mobile */
+@media (max-width: 480px) {
+    .context-menu {
+        min-width: 140px;
+    }
+    .context-item {
+        padding: 8px 12px;
+        font-size: 0.85rem;
+    }
+}
+
+/* Troll Modal */
+#troll-modal {
+    z-index: 10000;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+
+.troll-style {
+    border: 2px solid #ef4444;
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+    text-align: center;
+    min-width: 300px;
+}
+
+.troll-icon {
+    font-size: 3rem;
+    margin-bottom: 12px;
+}
+
+#troll-message {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text-main);
+    margin: 0 0 20px;
+    line-height: 1.4;
+}
+
+#troll-ok-btn {
+    width: 100%;
+    padding: 12px 20px;
+    font-size: 1rem;
+}
