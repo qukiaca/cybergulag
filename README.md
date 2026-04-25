@@ -1,4 +1,4 @@
-# pear2p
+# cybergulag
 чё-нить наклепаю
 
 сперва прописываю:
@@ -7,5 +7,4 @@
 потом прописываю:
 `cloudflared tunnel --url http://localhost:8080`
 
-и получаю ссылку вида:
-`https://xxxxxxxxxxxxxx.lhr.life`
+
