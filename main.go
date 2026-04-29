@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,19 +36,20 @@ type Peer struct {
 }
 
 type Message struct {
-	Type         string   `json:"type"`
-	ID           int64    `json:"id,omitempty"`
-	From         string   `json:"from"`
-	To           string   `json:"to"`
-	Payload      any      `json:"payload"`
-	MediaType    string   `json:"mediaType"`
-	FileName     string   `json:"fileName,omitempty"`
-	FileSize    int64    `json:"fileSize,omitempty"`
-	MimeType    string   `json:"mimeType,omitempty"`
-	ReplyToUser string   `json:"replyToUser,omitempty"`
-	ReplyToText string   `json:"replyToText,omitempty"`
-	IsRead     bool     `json:"isRead,omitempty"`
-	MessageIDs []int64 `json:"messageIds,omitempty"`
+	Type          string  `json:"type"`
+	ID            int64   `json:"id,omitempty"`
+	From          string  `json:"from"`
+	To            string  `json:"to"`
+	Payload       any     `json:"payload"`
+	MediaType     string  `json:"mediaType"`
+	FileName      string  `json:"fileName,omitempty"`
+	FileSize      int64   `json:"fileSize,omitempty"`
+	MimeType      string  `json:"mimeType,omitempty"`
+	ReplyToUser   string  `json:"replyToUser,omitempty"`
+	ReplyToText   string  `json:"replyToText,omitempty"`
+	ForwardedFrom string  `json:"forwardedFrom,omitempty"`
+	IsRead        bool    `json:"isRead,omitempty"`
+	MessageIDs    []int64 `json:"messageIds,omitempty"`
 }
 
 type Server struct {
@@ -57,14 +59,27 @@ type Server struct {
 	upgrader        websocket.Upgrader
 	lastUserRequest map[string]time.Time
 	fileStoragePath string
-	tokens          map[string]string
+	tokens          map[string]TokenData
+}
+
+var (
+	ipMessageTimestamps = make(map[string][]int64)
+	blockedIPs          = make(map[string]int64)
+	rateLimitMu         sync.Mutex
+)
+
+type TokenData struct {
+	Username  string    `json:"username"`
+	CreatedAt time.Time `json:"created_at"`
+	LastUsed  time.Time `json:"last_used"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 func NewServer(cfg config.Config, validator *config.OriginValidator, db *sql.DB) *Server {
 	return &Server{
 		peers:  make(map[string]*Peer),
 		db:     db,
-		tokens: make(map[string]string),
+		tokens: make(map[string]TokenData),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				origin := r.Header.Get("Origin")
@@ -94,11 +109,17 @@ func (s *Server) saveMessage(msg Message) int64 {
 
 	replyToUser := msg.ReplyToUser
 	replyToText := msg.ReplyToText
+	forwardedFrom := msg.ForwardedFrom
+
+	if forwardedFrom != "" {
+		log.Printf("📤 Forwarded message: from=%s, to=%s, original_author=%s, mediaType=%s",
+			msg.From, msg.To, forwardedFrom, msg.MediaType)
+	}
 
 	result, err := s.db.Exec(
-		`INSERT INTO messages (from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		msg.From, msg.To, payloadStr, msg.MediaType, msg.FileName, msg.FileSize, msg.MimeType, replyToUser, replyToText,
+		`INSERT INTO messages (from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, forwarded_from)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		msg.From, msg.To, payloadStr, msg.MediaType, msg.FileName, msg.FileSize, msg.MimeType, replyToUser, replyToText, forwardedFrom,
 	)
 	if err != nil {
 		log.Println("❌ Ошибка сохранения в БД:", err)
@@ -210,11 +231,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := generateToken()
+	tokenData := generateTokenData(req.Username)
 	s.mu.Lock()
-	s.tokens[token] = req.Username
+	s.tokens[token] = tokenData
 	s.mu.Unlock()
 
-	resp := map[string]string{"username": req.Username, "token": token}
+	resp := map[string]interface{}{
+		"username":  req.Username,
+		"token":     token,
+		"expiresAt": tokenData.ExpiresAt.Format(time.RFC3339),
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -223,6 +249,84 @@ func generateToken() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func generateTokenData(username string) TokenData {
+	now := time.Now()
+	return TokenData{
+		Username:  username,
+		CreatedAt: now,
+		LastUsed:  now,
+		ExpiresAt: now.Add(7 * 24 * time.Hour),
+	}
+}
+
+func (s *Server) validateToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tokenData, ok := s.tokens[token]
+	if !ok {
+		return "", false
+	}
+
+	if time.Now().After(tokenData.ExpiresAt) {
+		delete(s.tokens, token)
+		return "", false
+	}
+
+	tokenData.LastUsed = time.Now()
+	tokenData.ExpiresAt = time.Now().Add(7 * 24 * time.Hour)
+	s.tokens[token] = tokenData
+	log.Printf("🔑 Token refreshed for user=%s", tokenData.Username)
+
+	return tokenData.Username, true
+}
+
+// validateTokenWithStatus returns (username, ok, isExpired)
+// It doesn't modify token on WebSocket connection (only on HTTP API calls)
+func (s *Server) validateTokenWithStatus(token string) (string, bool, bool) {
+	if token == "" {
+		return "", false, false
+	}
+
+	s.mu.RLock()
+	tokenData, ok := s.tokens[token]
+	s.mu.RUnlock()
+
+	if !ok {
+		return "", false, false
+	}
+
+	if time.Now().After(tokenData.ExpiresAt) {
+		s.mu.Lock()
+		delete(s.tokens, token)
+		s.mu.Unlock()
+		return "", false, true
+	}
+
+	return tokenData.Username, true, false
+}
+
+func (s *Server) cleanupExpiredTokens() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	deleted := 0
+	for token, td := range s.tokens {
+		if now.After(td.ExpiresAt) {
+			delete(s.tokens, token)
+			deleted++
+		}
+	}
+	if deleted > 0 {
+		log.Printf("🧹 Cleaned up %d expired tokens", deleted)
+	}
 }
 
 // isRateLimited проверяет и обновляет время последнего запроса от IP.
@@ -253,13 +357,7 @@ func (s *Server) isRateLimited(ip string) bool {
 }
 
 func (s *Server) getUserFromToken(token string) (string, bool) {
-	if token == "" {
-		return "", false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	username, ok := s.tokens[token]
-	return username, ok
+	return s.validateToken(token)
 }
 
 // Handle get all users (for contacts list) with simple rate limiting
@@ -332,7 +430,7 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	unreadMap := make(map[string]int)
 	if username != "" {
 		rows, err := s.db.Query("SELECT from_user, COUNT(*) FROM messages WHERE to_user = ? AND is_read = 0 GROUP BY from_user", username)
@@ -347,11 +445,11 @@ func (s *Server) handleGetUsers(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	
+
 	log.Printf("📬 handleGetUsers: user=%s, unreadMap=%v", username, unreadMap)
-	
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"users": usernames,
+		"users":  usernames,
 		"unread": unreadMap,
 	})
 }
@@ -380,7 +478,7 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read
+		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read, forwarded_from, created_at
 		 FROM messages
 		 WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)
 		 ORDER BY id ASC LIMIT 50`,
@@ -397,10 +495,10 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 	var id int64
 	for rows.Next() {
 		var from, to, payload, mediaType string
-		var fileName, mimeType, replyToUser, replyToPayload sql.NullString
+		var fileName, mimeType, replyToUser, replyToPayload, forwardedFrom, createdAt sql.NullString
 		var fileSize int64
 		var isRead int
-		if err := rows.Scan(&id, &from, &to, &payload, &mediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead); err != nil {
+		if err := rows.Scan(&id, &from, &to, &payload, &mediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead, &forwardedFrom, &createdAt); err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
 		}
@@ -427,6 +525,12 @@ func (s *Server) handleGetHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		if replyToPayload.Valid {
 			msg["replyToText"] = replyToPayload.String
+		}
+		if forwardedFrom.Valid {
+			msg["forwardedFrom"] = forwardedFrom.String
+		}
+		if createdAt.Valid {
+			msg["createdAt"] = createdAt.String
 		}
 		messages = append(messages, msg)
 	}
@@ -484,10 +588,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if fileSize > GB1 {
-		t := time.Now().Add(7 * 24 * time.Hour)
+		t := time.Now().UTC().Add(7 * 24 * time.Hour)
 		expiresAt = &t
 	} else if fileSize > MB128 {
-		t := time.Now().Add(30 * 24 * time.Hour)
+		t := time.Now().UTC().Add(30 * 24 * time.Hour)
 		expiresAt = &t
 	}
 
@@ -515,7 +619,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	var expiresAtStr *string
 	if expiresAt != nil {
-		s := expiresAt.Format("2006-01-02 15:04:05")
+		s := expiresAt.UTC().Format("2006-01-02 15:04:05")
 		expiresAtStr = &s
 	}
 
@@ -544,6 +648,44 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		"fileSize": fileSize,
 		"mimeType": mimeType,
 	})
+
+	s.mu.RLock()
+	target, ok := s.peers[toUser]
+	s.mu.RUnlock()
+
+	if ok && target.Conn != nil {
+		progressMsg := Message{
+			Type:      "file_progress",
+			From:      username,
+			To:        toUser,
+			MediaType: "file",
+			FileName:  header.Filename,
+			FileSize:  fileSize,
+			MimeType:  mimeType,
+			Payload: map[string]interface{}{
+				"file_id": fileID,
+				"url":     "/api/file/" + fileUUID,
+				"status":  "done",
+			},
+		}
+		target.mu.Lock()
+		if err := target.Conn.WriteJSON(progressMsg); err != nil {
+			log.Printf("⚠️  Failed to send file_progress to %s: %v", toUser, err)
+		}
+		target.mu.Unlock()
+	}
+}
+
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	status int
+	written bool
+}
+
+func (rw *responseWriterWrapper) WriteHeader(status int) {
+	rw.status = status
+	rw.written = true
+	rw.ResponseWriter.WriteHeader(status)
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -651,7 +793,347 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Length", fmt.Sprint(fileSize))
 
-	http.ServeContent(w, r, fileName, info.ModTime(), f)
+	wrapper := &responseWriterWrapper{ResponseWriter: w}
+
+	s.mu.RLock()
+	sender, senderOnline := s.peers[fromUser]
+	s.mu.RUnlock()
+
+	if senderOnline && sender.Conn != nil {
+		downloadingMsg := Message{
+			Type:      "file_progress",
+			From:      username,
+			To:        fromUser,
+			MediaType: "file",
+			FileName:  fileName,
+			FileSize:  fileSize,
+			MimeType:  mimeType,
+			Payload: map[string]interface{}{
+				"file_id": id,
+				"url":     "/api/file/" + fileUUID,
+				"status":  "downloading",
+			},
+		}
+		sender.mu.Lock()
+		if err := sender.Conn.WriteJSON(downloadingMsg); err != nil {
+			log.Printf("⚠️  Failed to send file_progress (downloading) to %s: %v", fromUser, err)
+		}
+		sender.mu.Unlock()
+	}
+
+	http.ServeContent(wrapper, r, fileName, info.ModTime(), f)
+
+	if senderOnline && sender.Conn != nil {
+		status := "done"
+		if wrapper.status >= 400 {
+			status = "error"
+		}
+		completionMsg := Message{
+			Type:      "file_progress",
+			From:      username,
+			To:        fromUser,
+			MediaType: "file",
+			FileName:  fileName,
+			FileSize:  fileSize,
+			MimeType:  mimeType,
+			Payload: map[string]interface{}{
+				"file_id": id,
+				"url":     "/api/file/" + fileUUID,
+				"status":  status,
+			},
+		}
+		sender.mu.Lock()
+		if err := sender.Conn.WriteJSON(completionMsg); err != nil {
+			log.Printf("⚠️  Failed to send file_progress (%s) to %s: %v", status, fromUser, err)
+		}
+		sender.mu.Unlock()
+	}
+}
+
+// extractUUIDFromPath extracts UUID from /api/file/UUID?token=... path
+func extractUUIDFromPath(path string) string {
+	// Handle /api/file/UUID or /api/file/UUID?token=...
+	if strings.HasPrefix(path, "/api/file/") {
+		uuid := strings.TrimPrefix(path, "/api/file/")
+		// Remove query parameters if present
+		if idx := strings.Index(uuid, "?"); idx != -1 {
+			uuid = uuid[:idx]
+		}
+		return uuid
+	}
+	return path
+}
+
+func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract message ID from URL path: /api/message/{id}
+	path := strings.TrimPrefix(r.URL.Path, "/api/message/")
+	msgIDStr := strings.TrimSuffix(path, "/")
+	msgID, err := strconv.ParseInt(msgIDStr, 10, 64)
+	if err != nil || msgID == 0 {
+		http.Error(w, "invalid message id", http.StatusBadRequest)
+		return
+	}
+
+	// Get user from token
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Get message details
+	var fromUser, toUser, mediaType, fileName string
+	var payload string
+	err = s.db.QueryRow("SELECT from_user, to_user, media_type, file_name, payload FROM messages WHERE id = ?", msgID).Scan(&fromUser, &toUser, &mediaType, &fileName, &payload)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, "message not found", http.StatusNotFound)
+		} else {
+			log.Printf("❌ Ошибка поиска сообщения: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Check if user is the author
+	if fromUser != username {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Start transaction
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("❌ Ошибка начала транзакции: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	// If media message, check if file is referenced by other messages
+	if mediaType == "media" || mediaType == "video" || mediaType == "voice" || mediaType == "file" {
+		// Get the file UUID from payload or file_name
+		fileUUID := extractUUIDFromPath(payload)
+		if fileUUID == "" {
+			fileUUID = fileName
+		}
+
+		if fileUUID != "" {
+			// Count other messages with the same file
+			var count int
+			err = tx.QueryRow("SELECT COUNT(*) FROM messages WHERE (payload LIKE ? OR file_name = ?) AND id != ?", "%"+fileUUID+"%", fileUUID, msgID).Scan(&count)
+			if err != nil {
+				log.Printf("❌ Ошибка проверки ссылок на файл: %v", err)
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			if count == 0 {
+				// No other references, delete the file
+				var filePath string
+				err = tx.QueryRow("SELECT file_path FROM file_uploads WHERE file_uuid = ?", fileUUID).Scan(&filePath)
+				if err == nil {
+					// Delete file from storage
+					if err := os.Remove(filePath); err != nil {
+						log.Printf("⚠️ Ошибка удаления файла %s: %v", filePath, err)
+					} else {
+						log.Printf("🗑️ Файл удалён: %s", filePath)
+					}
+					// Delete from file_uploads
+					tx.Exec("DELETE FROM file_uploads WHERE file_uuid = ?", fileUUID)
+				} else {
+					log.Printf("⚠️ Файл не найден в file_uploads: %s", fileUUID)
+				}
+			} else {
+				log.Printf("⚠️ Файл не удалён: есть другие ссылки (%d)", count)
+			}
+		}
+	}
+
+	// Delete message from database
+	_, err = tx.Exec("DELETE FROM messages WHERE id = ?", msgID)
+	if err != nil {
+		log.Printf("❌ Ошибка удаления сообщения: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("❌ Ошибка коммита: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("🗑️ Сообщение удалено: id=%d, user=%s", msgID, username)
+
+	// Notify recipient via WebSocket
+	s.mu.RLock()
+	peer, ok := s.peers[toUser]
+	s.mu.RUnlock()
+	if ok && peer.Conn != nil {
+		deleteMsg := Message{
+			Type: "delete",
+			ID:   msgID,
+		}
+		if err := peer.Conn.WriteJSON(deleteMsg); err != nil {
+			log.Printf("⚠️ Ошибка отправки delete уведомления %s: %v", toUser, err)
+		} else {
+			log.Printf("📡 Delete уведомление отправлено: %s", toUser)
+		}
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func makePlaceholders(n int) []string {
+	placeholders := make([]string, n)
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	return placeholders
+}
+
+func (s *Server) handleBulkDeleteMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.IDs) == 0 {
+		http.Error(w, "no ids provided", http.StatusBadRequest)
+		return
+	}
+
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		auth = strings.TrimPrefix(auth, "Bearer ")
+	}
+	username, ok := s.getUserFromToken(auth)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Start transaction for bulk delete
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("❌ Ошибка начала транзакции: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
+	// Track deleted IDs and errors
+	var deletedIDs []int64
+	var toNotify = make(map[string][]int64) // to_user -> message IDs
+
+	// Process each message: verify ownership and delete
+	for _, msgID := range req.IDs {
+		// Get message details
+		var fromUser, toUser, mediaType, fileName, payload string
+		err := tx.QueryRow(
+			"SELECT from_user, to_user, media_type, file_name, payload FROM messages WHERE id = ?",
+			msgID,
+		).Scan(&fromUser, &toUser, &mediaType, &fileName, &payload)
+
+		if err == sql.ErrNoRows {
+			continue // Skip non-existent messages
+		}
+		if err != nil {
+			log.Printf("⚠️ Ошибка поиска сообщения %d: %v", msgID, err)
+			continue
+		}
+
+		// Check ownership: only author can delete
+		if fromUser != username {
+			log.Printf("⚠️ Пользователь %s не является автором сообщения %d", username, msgID)
+			continue
+		}
+
+		// Track recipient for notification
+		toNotify[toUser] = append(toNotify[toUser], msgID)
+
+		// Media cleanup (same as handleDeleteMessage)
+		if mediaType == "media" || mediaType == "video" || mediaType == "voice" || mediaType == "file" {
+			fileUUID := extractUUIDFromPath(payload)
+			if fileUUID == "" {
+				fileUUID = fileName
+			}
+
+			if fileUUID != "" {
+				var count int
+				tx.QueryRow("SELECT COUNT(*) FROM messages WHERE (payload LIKE ? OR file_name = ?) AND id != ?",
+					"%"+fileUUID+"%", fileUUID, msgID).Scan(&count)
+
+				if count == 0 {
+					var filePath string
+					tx.QueryRow("SELECT file_path FROM file_uploads WHERE file_uuid = ?", fileUUID).Scan(&filePath)
+					if err == nil {
+						os.Remove(filePath)
+						tx.Exec("DELETE FROM file_uploads WHERE file_uuid = ?", fileUUID)
+					}
+				}
+			}
+		}
+
+		// Delete message
+		_, err = tx.Exec("DELETE FROM messages WHERE id = ?", msgID)
+		if err != nil {
+			log.Printf("⚠️ Ошибка удаления сообщения %d: %v", msgID, err)
+			continue
+		}
+
+		deletedIDs = append(deletedIDs, msgID)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		log.Printf("❌ Ошибка коммита транзакции: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Send WS notifications to recipients
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for toUser, msgIDs := range toNotify {
+		recipient, ok := s.peers[toUser]
+		if !ok || recipient.Conn == nil {
+			continue
+		}
+		for _, id := range msgIDs {
+			deleteMsg := Message{Type: "delete", ID: id}
+			recipient.mu.Lock()
+			recipient.Conn.WriteJSON(deleteMsg)
+			recipient.mu.Unlock()
+		}
+	}
+
+	log.Printf("🗑️ Удалено сообщений: %d пользователем %s", len(deletedIDs), username)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"deleted": len(deletedIDs),
+		"ids":    deletedIDs,
+	})
 }
 
 func (s *Server) cleanupExpiredFiles() {
@@ -688,7 +1170,7 @@ func (s *Server) cleanupExpiredFiles() {
 
 func (s *Server) sendHistory(p *Peer) {
 	rows, err := s.db.Query(
-		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read FROM messages
+		`SELECT id, from_user, to_user, payload, media_type, file_name, file_size, mime_type, reply_to_user, reply_to_payload, is_read, forwarded_from FROM messages
 		 WHERE from_user = ? OR to_user = ?
 		 ORDER BY id ASC LIMIT 50`,
 		p.ID, p.ID,
@@ -702,10 +1184,10 @@ func (s *Server) sendHistory(p *Peer) {
 	for rows.Next() {
 		var msg Message
 		var payloadStr string
-		var fileName, mimeType, replyToUser, replyToPayload sql.NullString
+		var fileName, mimeType, replyToUser, replyToPayload, forwardedFrom sql.NullString
 		var fileSize int64
 		var isRead int
-		err := rows.Scan(&msg.ID, &msg.From, &msg.To, &payloadStr, &msg.MediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead)
+		err := rows.Scan(&msg.ID, &msg.From, &msg.To, &payloadStr, &msg.MediaType, &fileName, &fileSize, &mimeType, &replyToUser, &replyToPayload, &isRead, &forwardedFrom)
 		if err != nil {
 			log.Printf("🔧 Failed to scan history row: %v", err)
 			continue
@@ -724,6 +1206,9 @@ func (s *Server) sendHistory(p *Peer) {
 		}
 		if replyToPayload.Valid {
 			msg.ReplyToText = replyToPayload.String
+		}
+		if forwardedFrom.Valid {
+			msg.ForwardedFrom = forwardedFrom.String
 		}
 		msg.FileSize = fileSize
 		msg.IsRead = isRead == 1
@@ -777,9 +1262,49 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if auth == "" {
 		auth = r.URL.Query().Get("token")
 	}
-	username, ok := s.getUserFromToken(auth)
+
+	// Extract IP
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = strings.Split(r.RemoteAddr, ":")[0]
+	} else {
+		if idx := strings.Index(ip, ","); idx != -1 {
+			ip = strings.TrimSpace(ip[:idx])
+		}
+	}
+
+	// Check if IP is blocked
+	rateLimitMu.Lock()
+	if unblockTime, ok := blockedIPs[ip]; ok && time.Now().UnixMilli() < unblockTime {
+		rateLimitMu.Unlock()
+		conn, _ := s.upgrader.Upgrade(w, r, nil)
+		if conn != nil {
+			conn.WriteMessage(websocket.TextMessage, []byte("Слишком частые сообщения, попробуйте позже"))
+			conn.Close()
+		}
+		return
+	}
+	rateLimitMu.Unlock()
+
+	// Check token validity - returns (username, ok, isExpired)
+	username, ok, isExpired := s.validateTokenWithStatus(auth)
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		// Send close frame with appropriate code
+		conn, err := s.upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		closeCode := websocket.CloseNormalClosure
+		closeMsg := "unauthorized"
+		if isExpired {
+			closeCode = 4001 // Custom code for expired token
+			closeMsg = "token expired"
+		}
+		conn.WriteControl(closeCode, []byte(closeMsg), time.Now().Add(5*time.Second))
+		conn.Close()
 		return
 	}
 
@@ -906,6 +1431,41 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
+		// Rate Limiting Check
+		rateLimitMu.Lock()
+		now := time.Now().UnixMilli()
+
+		// Check block again (in case it was blocked during session)
+		if unblockTime, ok := blockedIPs[ip]; ok && now < unblockTime {
+			rateLimitMu.Unlock()
+			conn.Close()
+			return
+		}
+
+		// Count messages in the last second
+		timestamps := ipMessageTimestamps[ip]
+		var recent []int64
+		for _, ts := range timestamps {
+			if now-ts < 1000 {
+				recent = append(recent, ts)
+			}
+		}
+
+		if len(recent) >= 5 {
+			// Block IP for 5 minutes
+			blockedIPs[ip] = now + 5*60*1000
+			delete(ipMessageTimestamps, ip)
+			rateLimitMu.Unlock()
+			conn.WriteMessage(websocket.TextMessage, []byte("Слишком частые сообщения, попробуйте позже"))
+			conn.Close()
+			log.Printf("🚫 IP %s blocked for 5 minutes (flooding)", ip)
+			return
+		}
+
+		recent = append(recent, now)
+		ipMessageTimestamps[ip] = recent
+		rateLimitMu.Unlock()
+
 		var msg Message
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
 			preview := string(msgBytes)
@@ -933,61 +1493,89 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 				target.mu.Unlock()
 			}
+
+			// Send delivered status to sender
+			s.mu.RLock()
+			sender, senderOk := s.peers[msg.From]
+			s.mu.RUnlock()
+
+			if senderOk && sender.Conn != nil {
+				deliveredMsg := Message{
+					Type: "delivered",
+					ID:   newID,
+				}
+				sender.mu.Lock()
+				sender.Conn.WriteJSON(deliveredMsg)
+				sender.mu.Unlock()
+			}
 		}
-		
+
 		if msg.Type == "read_receipt" {
 			s.handleReadReceipt(msg.From, msg.MessageIDs)
+		}
+
+		// Typing indicator: переслать событие получателю (если онлайн)
+		if msg.Type == "typing" && msg.To != "" {
+			s.mu.RLock()
+			target, ok := s.peers[msg.To]
+			s.mu.RUnlock()
+
+			if ok && target.Conn != nil {
+				target.mu.Lock()
+				target.Conn.WriteJSON(msg)
+				target.mu.Unlock()
+			}
 		}
 	}
 }
 
 func (s *Server) handleReadReceipt(from string, messageIDs []int64) {
 	log.Printf("📬 read_receipt from=%s, ids=%v", from, messageIDs)
-	
+
 	if len(messageIDs) == 0 {
 		return
 	}
-	
+
 	placeholders := make([]string, len(messageIDs))
 	args := make([]any, len(messageIDs))
 	for i, id := range messageIDs {
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	
+
 	query := "UPDATE messages SET is_read = 1 WHERE id IN (" + strings.Join(placeholders, ",") + ")"
 	result, err := s.db.Exec(query, args...)
 	if err != nil {
 		log.Printf("🔧 Failed to mark messages as read: %v", err)
 		return
 	}
-	
+
 	rowsAffected, _ := result.RowsAffected()
 	log.Printf("📬 Updated %d messages as read", rowsAffected)
-	
+
 	args = append([]any{from}, args...)
 	placeholders = make([]string, len(messageIDs))
 	for i := range messageIDs {
 		placeholders[i] = "?"
 	}
-	
+
 	rows, err := s.db.Query("SELECT id, from_user FROM messages WHERE from_user != ? AND id IN ("+strings.Join(placeholders, ",")+")", args...)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
-	
+
 	for rows.Next() {
 		var msgID int64
 		var sender string
 		if err := rows.Scan(&msgID, &sender); err != nil {
 			continue
 		}
-		
+
 		s.mu.RLock()
 		peer, ok := s.peers[sender]
 		s.mu.RUnlock()
-		
+
 		if ok {
 			peer.mu.Lock()
 			peer.Conn.WriteJSON(Message{
@@ -1001,9 +1589,14 @@ func (s *Server) handleReadReceipt(from string, messageIDs []int64) {
 }
 
 func initDB() *sql.DB {
-	db, err := sql.Open("sqlite", "./pear2p.db")
+	db, err := sql.Open("sqlite", "./pear2p.db?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		log.Fatal("Ошибка открытия БД:", err)
+	}
+
+	_, err = db.Exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
+	if err != nil {
+		log.Printf("⚠️ Не удалось установить PRAGMA: %v", err)
 	}
 
 	// Create messages table
@@ -1051,6 +1644,10 @@ func initDB() *sql.DB {
 	if count == 0 {
 		db.Exec("ALTER TABLE messages ADD COLUMN is_read INTEGER DEFAULT 0;")
 	}
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='forwarded_from'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE messages ADD COLUMN forwarded_from TEXT;")
+	}
 
 	// Create users table for authentication
 	usersQuery := `
@@ -1094,6 +1691,12 @@ func initDB() *sql.DB {
 	_, err = db.Exec(fileUploadsQuery)
 	if err != nil {
 		log.Fatal("Ошибка создания таблицы file_uploads:", err)
+	}
+
+	// Добавить колонку expires_at если не существует (миграция для существующей БД)
+	db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('file_uploads') WHERE name='expires_at'").Scan(&count)
+	if count == 0 {
+		db.Exec("ALTER TABLE file_uploads ADD COLUMN expires_at DATETIME;")
 	}
 
 	// Индексы для файлов
@@ -1144,11 +1747,12 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			srv.cleanupExpiredFiles()
+			srv.cleanupExpiredTokens()
 		}
 	}()
 
 	http.HandleFunc("/ws", srv.handleWS)
-	
+
 	// Debug endpoint
 	http.HandleFunc("/debug/messages", func(w http.ResponseWriter, r *http.Request) {
 		user := r.URL.Query().Get("user")
@@ -1170,12 +1774,14 @@ func main() {
 			w.Write([]byte(fmt.Sprintf("%d | %s | %s | %d\n", id, from, to, isRead)))
 		}
 	})
-	
+
 	http.HandleFunc("/api/register", srv.handleRegister)
 	http.HandleFunc("/api/login", srv.handleLogin)
 	http.HandleFunc("/api/users", srv.handleGetUsers)
 	http.HandleFunc("/api/history", srv.handleGetHistory)
 	http.HandleFunc("/api/upload", srv.handleUpload)
+	http.HandleFunc("/api/message/", srv.handleDeleteMessage)
+	http.HandleFunc("/api/messages/bulk", srv.handleBulkDeleteMessages)
 	http.HandleFunc("/api/file/", srv.handleDownload)
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
@@ -1222,7 +1828,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("🚀 Pear2P запущен на http://localhost:%s", cfg.Port)
+	log.Printf("🚀 CyberGulag запущен на http://localhost:%s", cfg.Port)
 	log.Printf("🔒 Allowed origins: %s", validator)
 
 	// Запуск сервера

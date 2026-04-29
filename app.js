@@ -1,5 +1,5 @@
 /**
- * 📦 pear2p frontend — логика диалогов
+ * 📦 CyberGulag frontend — логика диалогов
  * 
  * Ключевые принципы:
  * 1. Диалог определяется парой участников: getDialogKey(a, b) = [a,b].sort().join('|')
@@ -54,7 +54,7 @@ function createAuthModal() {
     
     // Create modal content
     modalContainer.innerHTML = `
-        <h2 style="margin-top: 0; text-align: center;">Pear2P</h2>
+        <h2 style="margin-top: 0; text-align: center;">CyberGulag</h2>
         <div id="auth-error" style="color: #ff6b6b; margin-bottom: 1rem; min-height: 1.5rem; text-align: center;"></div>
         <div style="margin-bottom: 1rem;">
             <label style="display: block; margin-bottom: 0.5rem; font-size: 0.9rem;">Логин</label>
@@ -83,11 +83,35 @@ function createAuthModal() {
     };
 }
 
+// Session management
+function getSession() {
+    const raw = localStorage.getItem('CyberGulag-session');
+    if (!raw) return null;
+    try {
+        const data = JSON.parse(raw);
+        if (new Date(data.expiresAt) > new Date()) {
+            return data;
+        }
+    } catch {}
+    return null;
+}
+
+function saveSession(session) {
+    localStorage.setItem('CyberGulag-session', JSON.stringify(session));
+    localStorage.setItem('CyberGulag-username', session.username);
+}
+
+function clearSession() {
+    localStorage.removeItem('CyberGulag-session');
+    localStorage.removeItem('CyberGulag-username');
+}
+
 // Authentication flow with modal
 async function authenticateUser() {
-    const storedUsername = localStorage.getItem('pear2p-username');
-    if (storedUsername) {
-        return storedUsername;
+    const session = getSession();
+    if (session) {
+        localStorage.setItem('CyberGulag-username', session.username);
+        return session.username;
     }
     
     // Show modal
@@ -132,8 +156,14 @@ async function authenticateUser() {
                 }
                 
                 const data = await response.json();
-                localStorage.setItem('pear2p-username', data.username);
-                localStorage.setItem('pear2p-token', data.token || '');
+                const expiresAt = data.expiresAt || new Date(Date.now() + 7*24*60*60*1000).toISOString();
+                const session = {
+                    token: data.token || '',
+                    expiresAt: expiresAt,
+                    username: data.username
+                };
+                localStorage.setItem('CyberGulag-session', JSON.stringify(session));
+                localStorage.setItem('CyberGulag-username', data.username);
                 
                 // Hide modal
                 modal.backdrop.style.display = 'none';
@@ -162,7 +192,7 @@ async function authenticateUser() {
 
 // Initialize authentication and WebSocket connection
 async function initializeApp() {
-    console.log('🎯 pear2p frontend loaded, dialog logic: strict mode');
+    console.log('🎯 CyberGulag frontend loaded, dialog logic: strict mode');
     
     try {
         myId = await authenticateUser();
@@ -173,8 +203,11 @@ async function initializeApp() {
         // Initialize WebSocket connection with reconnection logic
         await connectWebSocket();
         
+        // Get token from session
+        const session = getSession();
+        const token = session?.token || '';
+        
         // Fetch all users for contact list
-        const token = localStorage.getItem('pear2p-token') || '';
         fetch('/api/users', {
             headers: { 'Authorization': 'Bearer ' + token }
         })
@@ -183,6 +216,13 @@ async function initializeApp() {
                 if (Array.isArray(data.users)) {
                     allUsers = data.users;
                     console.log('📥 /api/users: unreadCounts=', data.unread);
+                    
+                    // Продлеваем сессию при успешном запросе
+                    const currentSession = getSession();
+                    if (currentSession) {
+                        currentSession.expiresAt = new Date(Date.now() + 7*24*60*60*1000).toISOString();
+                        saveSession(currentSession);
+                    }
                     
                     // Очищаем и обновляем (Вариант Б)
                     Object.keys(unreadCounts).forEach(key => delete unreadCounts[key]);
@@ -222,7 +262,8 @@ function updateConnectionStatus(connected) {
 
 function connectWebSocket() {
     return new Promise((resolve, reject) => {
-        const token = localStorage.getItem('pear2p-token') || '';
+        const session = getSession();
+        const token = session?.token || '';
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         
         // WebSocket не поддерживает кастомные заголовки, используем query param
@@ -233,6 +274,12 @@ function connectWebSocket() {
             reconnectAttempts = 0;
             updateConnectionStatus(true);
             
+            // Устанавливаем флаг готовности уведомлений через 1.5с
+            setTimeout(() => {
+                isReadyForNotifications = true;
+                console.log('🔔 Уведомления готовы');
+            }, 1500);
+
             // Отправляем накопленные сообщения и обновляем их статус
             while (messageQueue.length > 0) {
                 const queued = messageQueue.shift();
@@ -250,7 +297,7 @@ function connectWebSocket() {
                 const msg = JSON.parse(e.data);
                 
                 // Проверяем известные типы сообщений
-                const knownTypes = ['contacts', 'chat'];
+                const knownTypes = ['contacts', 'chat', 'delete', 'typing', 'delivered'];
                 if (!knownTypes.includes(msg.type)) {
                     console.warn(`⚠️ Неизвестный тип сообщения: "${msg.type}"`, msg);
                     return;
@@ -264,16 +311,17 @@ function connectWebSocket() {
                 }
                 if (msg.type === "chat") {
                     displayMessage(msg.from, msg.to, msg.payload, msg.mediaType, {
-                        fileName: msg.fileName,
-                        fileSize: msg.fileSize,
-                        mimeType: msg.mimeType,
-                        id: msg.id,
-                        replyToUser: msg.replyToUser,
-                        replyToText: msg.replyToText,
-                        isRead: msg.isRead
-                    });
+                            fileName: msg.fileName,
+                            fileSize: msg.fileSize,
+                            mimeType: msg.mimeType,
+                            id: msg.id,
+                            replyToUser: msg.replyToUser,
+                            replyToText: msg.replyToText,
+                            isRead: msg.isRead,
+                            forwardedFrom: msg.forwardedFrom
+                        });
                     
-                    if (msg.from !== myId && targetPeer !== msg.from) {
+                    if (isReadyForNotifications && msg.from !== myId && targetPeer !== msg.from) {
                         unreadCounts[msg.from] = (unreadCounts[msg.from] || 0) + 1;
                         renderContactList();
                         playNotifySound();
@@ -288,6 +336,47 @@ function connectWebSocket() {
                             statusEl.textContent = '✓✓';
                             statusEl.classList.add('read');
                         }
+                    }
+                }
+
+                // Message delivered status
+                if (msg.type === "delivered") {
+                    const msgEl = chatEl.querySelector(`.msg[data-id="${msg.id}"]`);
+                    if (msgEl) {
+                        const statusEl = msgEl.querySelector('.msg-status');
+                        if (statusEl && !statusEl.classList.contains('read')) {
+                            statusEl.textContent = '✓';
+                            statusEl.classList.add('delivered');
+                        }
+                    }
+                }
+
+                if (msg.type === "delete") {
+                    const msgEl = chatEl.querySelector(`.msg[data-id="${msg.id}"]`);
+                    if (msgEl) {
+                        // Cleanup any Blob URLs in this message
+                        msgEl.querySelectorAll('img[src^="blob:"], video[src^="blob:"], audio[src^="blob:"]').forEach(el => {
+                            const src = el.src;
+                            if (src.startsWith('blob:')) {
+                                try { URL.revokeObjectURL(src); } catch (e) {}
+                                const idx = createdBlobURLs.indexOf(src);
+                                if (idx > -1) createdBlobURLs.splice(idx, 1);
+                            }
+                        });
+                        msgEl.remove();
+                        console.log(`🗑️ Сообщение удалено: ${msg.id}`);
+                    }
+                }
+
+                // Typing indicator: показать плашку "печатает..."
+                if (msg.type === "typing" && msg.from) {
+                    // Скрыть индикатор при получении обычного сообщения
+                    if (targetPeer === msg.from) {
+                        hideTypingIndicator();
+                    }
+                    // Показать индикатор только если это текущий диалог
+                    if (targetPeer === msg.from) {
+                        showTypingIndicator(msg.from);
                     }
                 }
             } catch (err) {
@@ -307,14 +396,15 @@ function connectWebSocket() {
         };
         
         ws.onclose = (event) => {
+            isReadyForNotifications = false;
+            hideTypingIndicator(); // Hide typing indicator on disconnect
             console.log(`🔌 WebSocket соединение закрыто (code: ${event.code}, reason: ${event.reason})`);
             updateConnectionStatus(false);
 
-            // Очищаем токен при критических ошибках
-            if (event.code === 1006 || event.code === 4001) {
-                console.warn('⚠️ WS closed with critical code - clearing token');
-                localStorage.removeItem('pear2p-token');
-                localStorage.removeItem('pear2p-username');
+            // Очищаем токен при критических ошибках или истечении
+            if (event.code === 1006 || event.code === 4001 || event.code === 4019) {
+                console.warn('⚠️ WS closed with critical code - clearing session');
+                clearSession();
                 // Показать модалку авторизации
                 authenticateUser().then(() => {
                     connectWebSocket();
@@ -347,6 +437,7 @@ let lastNotificationTime = 0;
 let allUsers = [];
 const onlineUsers = new Set();
 const unreadCounts = {};
+let isReadyForNotifications = false;
 
 let mediaMode = 'voice';
 let isRecording = false;
@@ -519,6 +610,7 @@ function showFileConfirmModal(file, targetPeer) {
 
             try {
                 previewObjectURL = URL.createObjectURL(file);
+                createdBlobURLs.push(previewObjectURL); // Track for cleanup
                 cleanupNeeded = true;
                 console.log('🔗 ObjectURL created:', previewObjectURL?.substring(0, 50) + '...');
 
@@ -622,7 +714,8 @@ function showFileConfirmModal(file, targetPeer) {
                 formData.append('file', uploadFile);
                 formData.append('to_user', toUser);
 
-                const token = localStorage.getItem('pear2p-token') || '';
+                const session = getSession();
+                const token = session?.token || '';
                 try {
                     console.log('🌐 Fetch start');
                     const resp = await fetch('/api/upload', {
@@ -661,7 +754,8 @@ function showFileConfirmModal(file, targetPeer) {
                     renderFileMessage(myId, toUser, data.url, mediaType,
                         data.fileName || uploadFile.name,
                         data.fileSize || uploadFile.size,
-                        data.mimeType || uploadFile.type);
+                        data.mimeType || uploadFile.type,
+                        null, undefined, {});
                     console.log('✅ File rendered in chat');
                     resolve();
                 } catch (err) {
@@ -708,9 +802,21 @@ function showFileConfirmModal(file, targetPeer) {
     });
 }
 
-function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeType, msgId, isRead) {
-    const token = localStorage.getItem('pear2p-token') || '';
-    const tokenParam = '?token=' + encodeURIComponent(token);
+function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeType, msgId, isRead, extra = {}) {
+    const session = getSession();
+    const token = session?.token || '';
+
+    // Insert date separator if date changed
+    renderDateSeparator(extra.createdAt);
+
+    let finalUrl;
+    if (url.startsWith('/api/file/')) {
+        finalUrl = url.includes('?token=')
+            ? url
+            : url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
+    } else {
+        finalUrl = `/api/file/${url}?token=${encodeURIComponent(token)}`;
+    }
 
     const ext = fileName?.split('.').pop()?.toLowerCase() || '';
     const mime = mimeType?.toLowerCase() || '';
@@ -740,6 +846,26 @@ function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeTyp
     }
     div.dataset.from = from;
 
+    // Forwarded message header
+    if (extra.forwardedFrom) {
+        const forwardHeader = document.createElement('div');
+        forwardHeader.className = 'msg-forwarded-header';
+        forwardHeader.textContent = (extra.forwardedFrom === myId ? 'Вы' : extra.forwardedFrom) + ':';
+
+        forwardHeader.onclick = (e) => {
+            e.stopPropagation();
+            const targetUser = extra.forwardedFrom;
+            if (targetUser && targetUser !== myId) {
+                const contactEl = document.querySelector(`#contactList li[data-user="${targetUser}"]`);
+                if (contactEl) {
+                    contactEl.click();
+                }
+            }
+        };
+
+        div.appendChild(forwardHeader);
+    }
+
     const nameEl = document.createElement('strong');
     nameEl.textContent = from === myId ? 'Вы' : from;
     nameEl.style.display = 'block';
@@ -754,25 +880,27 @@ function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeTyp
 
     if (isImage || (isMediaFallback && urlExt && ['png','jpg','jpeg','gif','webp'].includes(urlExt))) {
         const img = document.createElement('img');
-        img.src = url + tokenParam;
+        img.src = finalUrl;
         img.loading = 'lazy';
-        img.onerror = () => { console.error('Ошибка загрузки изображения:', url); img.alt = '❌'; };
-        img.onclick = () => openMediaViewer(url + tokenParam, 'image');
+        img.onerror = () => { console.error('❌ Картинка не загрузилась:', finalUrl); img.alt = '❌'; };
+        img.onclick = () => openMediaViewer(finalUrl, 'image');
         img.style.cursor = 'pointer';
         content.appendChild(img);
     } else if (isVideo) {
         const video = document.createElement('video');
-        video.src = url + tokenParam;
+        video.src = finalUrl;
         video.controls = true;
         video.preload = 'metadata';
-        video.onclick = () => openMediaViewer(url + tokenParam, 'video');
+        video.onerror = () => console.error('❌ Видео не загрузилось:', finalUrl);
+        video.onclick = () => openMediaViewer(finalUrl, 'video');
         video.style.cursor = 'pointer';
         content.appendChild(video);
     } else if (isAudio) {
         const audio = document.createElement('audio');
-        audio.src = url + tokenParam;
+        audio.src = finalUrl;
         audio.controls = true;
         audio.preload = 'none';
+        audio.onerror = () => console.error('❌ Аудио не загрузилось:', finalUrl);
         content.appendChild(audio);
     } else {
         const icon = document.createElement('span');
@@ -798,7 +926,7 @@ function renderFileMessage(from, to, url, mediaType, fileName, fileSize, mimeTyp
 
         const btn = document.createElement('a');
         btn.className = 'download-btn';
-        btn.href = url + tokenParam;
+        btn.href = finalUrl;
         btn.download = fileName;
         btn.textContent = 'Скачать';
         content.appendChild(btn);
@@ -1034,7 +1162,8 @@ function sendMedia() {
  * @returns {Promise<Array>} Массив сообщений
  */
 async function loadHistory(targetUser) {
-    const token = localStorage.getItem('pear2p-token') || '';
+    const session = getSession();
+    const token = session?.token || '';
     try {
         const response = await fetch(`/api/history?with=${encodeURIComponent(targetUser)}`, {
             headers: {
@@ -1084,6 +1213,9 @@ function renderContactList() {
             targetPeer = null;
             targetPeer = id;
             
+            // Скрываем typing indicator при смене диалога
+            hideTypingIndicator();
+            
             // Сбрасываем счетчик непрочитанных
             unreadCounts[id] = 0;
             renderContactList();
@@ -1093,6 +1225,8 @@ function renderContactList() {
             
             // Очищаем чат ПОСЛЕ получения ответа
             chatEl.innerHTML = "";
+            cleanupBlobURLs(); // Clear Blob URLs to free memory
+            lastRenderedDate = null; // Reset date separators
             console.log(`🗑️ Очистка чата, сообщений: ${chatEl.children.length}`);
             
             if (serverMessages.length > 0) {
@@ -1102,13 +1236,14 @@ function renderContactList() {
                     const toUser = msg.to || id;
                     if (msg.mediaType === 'file' || msg.mediaType === 'media') {
                         renderFileMessage(msg.from, toUser, msg.payload, msg.mediaType,
-                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead);
+                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead, { forwardedFrom: msg.forwardedFrom });
                     } else {
                         renderMessageElement(msg.from, msg.payload, msg.mediaType || msg.type || 'text', {
                             id: msg.id,
                             replyToUser: msg.replyToUser,
                             replyToText: msg.replyToText,
-                            isRead: msg.isRead
+                            isRead: msg.isRead,
+                            forwardedFrom: msg.forwardedFrom
                         });
                     }
                 });
@@ -1121,13 +1256,14 @@ function renderContactList() {
                     const toUser = msg.to || id;
                     if (msg.type === 'file' || msg.type === 'media') {
                         renderFileMessage(msg.from, toUser, msg.payload, msg.type,
-                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead);
+                            msg.fileName, msg.fileSize, msg.mimeType, msg.id, msg.isRead, { forwardedFrom: msg.forwardedFrom });
                     } else {
                         renderMessageElement(msg.from, msg.payload, msg.type || 'text', {
                             id: msg.id,
                             replyToUser: msg.replyToUser,
                             replyToText: msg.replyToText,
-                            isRead: msg.isRead
+                            isRead: msg.isRead,
+                            forwardedFrom: msg.forwardedFrom
                         });
                     }
                 });
@@ -1199,7 +1335,7 @@ function displayMessage(from, to, payload, type = 'text', extra = {}) {
         
         if (dialogKey === currentDialogKey) {
             console.log(`📨 [${dialogKey}] от ${from} к ${to}: показано (текущий диалог)`);
-            if (type === 'file' || type === 'media') { return renderFileMessage(from, to, payload, type, extra.fileName, extra.fileSize, extra.mimeType, extra.id, extra.isRead); } 
+            if (type === 'file' || type === 'media') { return renderFileMessage(from, to, payload, type, extra.fileName, extra.fileSize, extra.mimeType, extra.id, extra.isRead, extra); } 
             return renderMessageElement(from, payload, type, extra);
         }
     }
@@ -1208,8 +1344,68 @@ function displayMessage(from, to, payload, type = 'text', extra = {}) {
     console.log(`📨 [${dialogKey}] от ${from} к ${to}: забуферизировано`);
 }
 
+// Date separator formatting (Telegram-style)
+let lastRenderedDate = null;
+
+// Track created Blob URLs for cleanup
+const createdBlobURLs = [];
+
+function cleanupBlobURLs() {
+    createdBlobURLs.forEach(url => {
+        try { URL.revokeObjectURL(url); } catch (e) {}
+    });
+    createdBlobURLs.length = 0;
+}
+
+function formatDateSeparator(dateStr) {
+    // Parse date string (expected format: YYYY-MM-DD HH:MM:SS or ISO)
+    const date = dateStr ? new Date(dateStr) : new Date();
+    if (isNaN(date.getTime())) return null;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    const msgDate = new Date(date);
+    msgDate.setHours(0, 0, 0, 0);
+    
+    if (msgDate.getTime() === today.getTime()) return 'Сегодня';
+    if (msgDate.getTime() === yesterday.getTime()) return 'Вчера';
+    
+    // Russian date format
+    const months = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+    return `${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+function renderDateSeparator(dateStr) {
+    const formatted = formatDateSeparator(dateStr);
+    if (!formatted || formatted === lastRenderedDate) return;
+    
+    lastRenderedDate = formatted;
+    
+    const sep = document.createElement('div');
+    sep.className = 'date-separator';
+    sep.innerHTML = `<span>--- ${formatted} ---</span>`;
+    chatEl.appendChild(sep);
+}
+
 // Вынесённая функция рендеринга элемента сообщения (для переиспользования)
 function renderMessageElement(from, payload, type, extra = {}) {
+    const session = getSession();
+    const token = session?.token || '';
+
+    // Insert date separator if date changed
+    renderDateSeparator(extra.createdAt);
+
+    let mediaUrl = payload;
+    if (payload && !payload.startsWith('/api/file/') && !payload.startsWith('data:') && !payload.startsWith('http')) {
+        mediaUrl = '/api/file/' + payload + '?token=' + encodeURIComponent(token);
+    } else if (payload && payload.startsWith('/api/file/') && !payload.includes('?token=')) {
+        mediaUrl = payload + '?token=' + encodeURIComponent(token);
+    }
+
     const div = document.createElement("div");
     div.className = `msg ${from === myId ? 'mine' : ''}`;
     if (extra.id) {
@@ -1219,7 +1415,7 @@ function renderMessageElement(from, payload, type, extra = {}) {
         div.dataset.isRead = extra.isRead ? '1' : '0';
     }
     div.dataset.from = from;
-    
+
     const displayName = from === myId ? "Вы" : from;
     
     // Reply quote - если есть данные об ответе
@@ -1246,6 +1442,26 @@ function renderMessageElement(from, payload, type, extra = {}) {
         div.appendChild(replyDiv);
     }
     
+    // Forwarded message header
+    if (extra.forwardedFrom) {
+        const forwardHeader = document.createElement("div");
+        forwardHeader.className = "msg-forwarded-header";
+        forwardHeader.textContent = (extra.forwardedFrom === myId ? "Вы" : extra.forwardedFrom) + ":";
+        
+        forwardHeader.onclick = (e) => {
+            e.stopPropagation();
+            const targetUser = extra.forwardedFrom;
+            if (targetUser && targetUser !== myId) {
+                const contactEl = document.querySelector(`#contactList li[data-user="${targetUser}"]`);
+                if (contactEl) {
+                    contactEl.click();
+                }
+            }
+        };
+        
+        div.appendChild(forwardHeader);
+    }
+    
     // Создаём имя безопасно — через textContent
     const nameEl = document.createElement("strong");
     nameEl.textContent = displayName;
@@ -1265,7 +1481,7 @@ function renderMessageElement(from, payload, type, extra = {}) {
         
     } else if (type === 'voice') {
         const audio = document.createElement("audio");
-        audio.src = payload;
+        audio.src = mediaUrl;
         audio.controls = true;
         audio.style.maxWidth = "100%";
         audio.style.marginTop = "8px";
@@ -1274,10 +1490,10 @@ function renderMessageElement(from, payload, type, extra = {}) {
             audio.addEventListener('play', () => sendReadReceipt(extra.id, extra.isRead));
         }
         div.appendChild(audio);
-        
+
     } else if (type === 'video') {
         const video = document.createElement("video");
-        video.src = payload;
+        video.src = mediaUrl;
         video.className = "video-circle";
         video.loop = true;
         video.playsInline = true;
@@ -1417,6 +1633,50 @@ msgInput.addEventListener('input', () => {
     autoResizeTextarea();
 });
 
+// Typing Indicator: отправка события "typing" с debounce 1.5 сек
+let lastTypingSent = 0;
+const TYPING_DEBOUNCE_MS = 1500;
+const TYPING_TIMEOUT_MS = 3000;
+
+function showTypingIndicator(user) {
+    const indicator = document.getElementById('typing-indicator');
+    if (!indicator) return;
+    
+    indicator.textContent = (user === myId ? 'Вы' : user) + ' печатает...';
+    indicator.classList.remove('hidden');
+    
+    // Сброс таймера при новом событии от того же пользователя
+    if (indicator._typingTimeout) {
+        clearTimeout(indicator._typingTimeout);
+    }
+    
+    indicator._typingTimeout = setTimeout(() => {
+        indicator.classList.add('hidden');
+        indicator._typingTimeout = null;
+    }, TYPING_TIMEOUT_MS);
+}
+
+function hideTypingIndicator() {
+    const indicator = document.getElementById('typing-indicator');
+    if (!indicator) return;
+    indicator.classList.add('hidden');
+    if (indicator._typingTimeout) {
+        clearTimeout(indicator._typingTimeout);
+        indicator._typingTimeout = null;
+    }
+}
+
+msgInput.addEventListener('input', () => {
+    if (!targetPeer || !ws || ws.readyState !== WebSocket.OPEN) return;
+    
+    // Debounce: не спамить событиями при каждом нажатии клавиши
+    const now = Date.now();
+    if (now - lastTypingSent < TYPING_DEBOUNCE_MS) return;
+    
+    lastTypingSent = now;
+    ws.send(JSON.stringify({ type: 'typing', to: targetPeer }));
+});
+
 const isMobile = typeof window !== 'undefined' && (
     /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
     window.matchMedia("(pointer: coarse)").matches ||
@@ -1502,6 +1762,10 @@ let touchTimer = null;
 function showContextMenu(x, y, msgEl) {
     if (!contextMenu || !msgEl) return;
 
+    // Предотвращаем всплытие и дефолтное поведение
+    event?.stopPropagation?.();
+    event?.preventDefault?.();
+
     selectedMessageEl = msgEl;
 
     // Позиционирование с учетом границ экрана
@@ -1532,21 +1796,38 @@ function hideContextMenu() {
 }
 
 // Reply preview state
-let replyingTo = null; // { author: string, text: string, element: element }
+let replyingTo = null; // { author: string, text: string, element: element, mediaType: string }
 
-function showReplyPreview(author, text, msgEl) {
-    replyingTo = { author, text, element: msgEl };
+function showReplyPreview(author, text, msgEl, mediaType) {
+    replyingTo = { author, text, element: msgEl, mediaType };
     
     const preview = document.getElementById('reply-preview');
     const authorEl = document.getElementById('reply-preview-author');
     const textEl = document.getElementById('reply-preview-text');
     
-    if (preview && authorEl && textEl) {
-        authorEl.textContent = author;
+    if (!preview || !authorEl || !textEl) return;
+    
+    authorEl.textContent = author;
+    
+    // Reply preview with media type icons
+    const mediaIcons = {
+        'media': '🖼️ Изображение',
+        'video': '🎬 Видео',
+        'file': '📁 Файл',
+        'voice': '🎤 Голосовое'
+    };
+    
+    if (mediaType && mediaIcons[mediaType]) {
+        textEl.textContent = mediaIcons[mediaType];
+        preview.classList.remove('reply-preview--media', 'reply-preview--video', 'reply-preview--file', 'reply-preview--voice');
+        preview.classList.add('reply-preview--' + mediaType);
+    } else {
         textEl.textContent = text;
-        preview.classList.remove('hidden');
-        preview.classList.add('active');
+        preview.classList.remove('reply-preview--media', 'reply-preview--video', 'reply-preview--file', 'reply-preview--voice');
     }
+    
+    preview.classList.remove('hidden');
+    preview.classList.add('active');
     
     // Focus input
     msgInput?.focus();
@@ -1603,13 +1884,188 @@ function showTrollModal(messageText) {
     okBtn.addEventListener('click', closeModal);
 }
 
+function getSelectedMessagesData() {
+    const selectedEls = chatEl?.querySelectorAll('.msg.selected');
+    if (!selectedEls || selectedEls.length === 0) return [];
+
+    return Array.from(selectedEls).map(msgEl => {
+        const data = {
+            id: msgEl.dataset.id ? parseInt(msgEl.dataset.id, 10) : null,
+            from: msgEl.dataset.from,
+            payload: '',
+            mediaType: 'text',
+            fileName: undefined,
+            fileSize: undefined,
+            mimeType: undefined,
+        };
+
+        const imgEl = msgEl.querySelector('.msg-media img, .msg-file img');
+        const videoEl = msgEl.querySelector('.msg-media video');
+        const audioEl = msgEl.querySelector('.msg-media audio');
+        const linkEl = msgEl.querySelector('.download-btn');
+        const textEl = msgEl.querySelector('span:not(.msg-reply-author):not(.msg-reply-text):not(.msg-status)');
+
+        if (imgEl) {
+            const url = imgEl.src;
+            const uuidMatch = url.match(/\/api\/file\/([a-f0-9-]+)/i);
+            data.payload = uuidMatch ? uuidMatch[1] : url;
+            data.mediaType = 'media';
+        } else if (videoEl) {
+            const url = videoEl.src;
+            const uuidMatch = url.match(/\/api\/file\/([a-f0-9-]+)/i);
+            data.payload = uuidMatch ? uuidMatch[1] : url;
+            data.mediaType = 'video';
+        } else if (audioEl) {
+            const url = audioEl.src;
+            const uuidMatch = url.match(/\/api\/file\/([a-f0-9-]+)/i);
+            data.payload = uuidMatch ? uuidMatch[1] : url;
+            data.mediaType = 'voice';
+        } else if (linkEl) {
+            const url = linkEl.href;
+            const uuidMatch = url.match(/\/api\/file\/([a-f0-9-]+)/i);
+            data.payload = uuidMatch ? uuidMatch[1] : url;
+            data.mediaType = 'file';
+            const fileInfoEl = msgEl.querySelector('.file-info');
+            if (fileInfoEl) {
+                const nameEl = fileInfoEl.querySelector('.file-name');
+                const sizeEl = fileInfoEl.querySelector('.file-size');
+                data.fileName = nameEl?.textContent || '';
+                data.fileSize = sizeEl?.textContent || '';
+            }
+        } else if (textEl) {
+            data.payload = textEl.textContent.trim();
+            data.mediaType = 'text';
+        }
+
+        return data;
+    });
+}
+
+function showForwardModal() {
+    const messages = getSelectedMessagesData();
+    if (messages.length === 0) {
+        showToast('Выберите сообщения для пересылки');
+        return;
+    }
+
+    const modal = document.getElementById('forward-modal');
+    const previewEl = document.getElementById('forward-preview');
+    const recipientSelect = document.getElementById('forward-recipient');
+    const sendBtn = document.getElementById('forward-send-btn');
+    const cancelBtn = document.getElementById('forward-cancel-btn');
+
+    if (!modal || !previewEl || !recipientSelect) {
+        alert('Ошибка: не найдены элементы модалки пересылки');
+        return;
+    }
+
+    const preview = messages.slice(0, 3).map(m => {
+        const text = m.mediaType === 'text' ? m.payload : `[${m.mediaType}]`;
+        return `<div class="forward-preview-item">${m.from}: ${text.substring(0, 30)}${text.length > 30 ? '...' : ''}</div>`;
+    }).join('');
+    const more = messages.length > 3 ? `<div class="forward-preview-more">+ ещё ${messages.length - 3}</div>` : '';
+    previewEl.innerHTML = preview + more;
+
+    recipientSelect.innerHTML = '';
+    allUsers.forEach(user => {
+        if (user === myId) return;
+        const option = document.createElement('option');
+        option.value = user;
+        option.textContent = user;
+        recipientSelect.appendChild(option);
+    });
+
+    modal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+
+    const closeModal = () => {
+        modal.classList.add('hidden');
+        document.body.style.overflow = '';
+        document.removeEventListener('keydown', handleKeydown);
+    };
+
+    const handleKeydown = (e) => {
+        if (e.key === 'Escape') {
+            closeModal();
+        }
+    };
+
+    modal.onclick = (e) => {
+        if (e.target === modal) {
+            closeModal();
+        }
+    };
+
+    document.addEventListener('keydown', handleKeydown);
+
+    if (sendBtn) {
+        sendBtn.onclick = () => {
+            const recipient = recipientSelect.value;
+            if (!recipient) {
+                showToast('Выберите получателя');
+                return;
+            }
+
+            forwardMessages(messages, recipient);
+            closeModal();
+        };
+    }
+
+    if (cancelBtn) {
+        cancelBtn.onclick = closeModal;
+    }
+}
+
+function forwardMessages(messages, recipient) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        showToast('Нет соединения');
+        return;
+    }
+
+    messages.forEach(msg => {
+        const forwarded = {
+            type: 'chat',
+            to: recipient,
+            payload: msg.payload,
+            mediaType: msg.mediaType,
+            forwardedFrom: msg.from,
+        };
+
+        if (msg.fileName) forwarded.fileName = msg.fileName;
+        if (msg.fileSize) forwarded.fileSize = msg.fileSize;
+        if (msg.mimeType) forwarded.mimeType = msg.mimeType;
+
+        ws.send(JSON.stringify(forwarded));
+    });
+
+    showToast(`Переслано ${messages.length} сообщений`);
+
+    chatEl?.querySelectorAll('.msg.selected').forEach(el => {
+        el.classList.remove('selected');
+    });
+    selectedMessageEl = null;
+}
+
 function getReplyData(msgEl) {
     const authorEl = msgEl.querySelector('.msg-reply-author, strong');
     const textEl = msgEl.querySelector('.msg-reply-text');
     const contentEl = msgEl.querySelector('span');
+    const mediaEl = msgEl.querySelector('.msg-media, .msg-file');
     
     const author = authorEl?.textContent || 'Unknown';
     let text = textEl?.textContent || contentEl?.textContent || '';
+    
+    // Detect media type from class
+    let mediaType = null;
+    if (msgEl.classList.contains('msg-media') || mediaEl?.classList.contains('msg-media')) {
+        const img = mediaEl?.querySelector('img');
+        const video = mediaEl?.querySelector('video');
+        const audio = mediaEl?.querySelector('audio');
+        if (img) mediaType = 'media';
+        else if (video) mediaType = 'video';
+        else if (audio && audio.src.includes('/api/file/') || audio?.src.startsWith('data:')) mediaType = 'voice';
+        else mediaType = 'file';
+    }
     
     const id = msgEl.dataset.id ? parseInt(msgEl.dataset.id, 10) : null;
     
@@ -1617,7 +2073,7 @@ function getReplyData(msgEl) {
         text = text.substring(0, 50) + '...';
     }
     
-    return { author, text, id };
+    return { author, text, id, mediaType };
 }
 
 // Cancel reply button
@@ -1669,23 +2125,179 @@ function handleContextAction(action) {
             }
             break;
         case 'reply':
-            showReplyPreview(replyData.author, replyData.text, selectedMessageEl);
+            showReplyPreview(replyData.author, replyData.text, selectedMessageEl, replyData.mediaType);
             showToast('Ответить');
             break;
         case 'forward':
-            console.log('Forward message:', selectedMessageEl);
-            showToast('Переслать (TODO)');
+            showForwardModal();
             break;
         case 'delete':
-            showTrollModal('КУДА УДАЛЯТЬ СОБРАЛСЯ!');
-            break;
+            // Collect all selected messages
+            const selectedMsgs = chatEl.querySelectorAll('.msg.selected');
+            const msgIds = [];
+            selectedMsgs.forEach(el => {
+                if (el.dataset.id) msgIds.push(parseInt(el.dataset.id, 10));
+            });
+            
+            if (msgIds.length === 0) {
+                // Fallback: single message delete
+                const msgId = selectedMessageEl?.dataset.id;
+                if (!msgId) {
+                    showToast('Нельзя удалить это сообщение');
+                    break;
+                }
+                hideContextMenu();
+                showDeleteConfirm(parseInt(msgId, 10));
+                return;
+            }
+            
+            // Multiple messages: use bulk delete
+            hideContextMenu();
+            
+            if (msgIds.length === 1) {
+                showDeleteConfirm(msgIds[0]);
+            } else {
+                // Show bulk delete confirmation
+                showDeleteConfirm(msgIds);
+            }
+            return;
         case 'edit':
             showTrollModal('РЕДАЧЕР ХУЖЕ ПИДОРАСА!');
             break;
     }
+
+    if (action !== 'select' && action !== 'forward') {
+        selectedMessageEl?.classList.remove('selected');
+    }
+    if (action !== 'forward') {
+        hideContextMenu();
+    }
+}
+
+function deleteMessage(msgId) {
+    const session = getSession();
+    const token = session?.token || '';
+
+    // Bulk delete if array
+    if (Array.isArray(msgId)) {
+        fetch('/api/messages/bulk', {
+            method: 'DELETE',
+            headers: {
+                'Authorization': 'Bearer ' + token,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ ids: msgId })
+        })
+        .then(response => response.json())
+        .then(data => {
+            // Use server-returned IDs for accurate DOM removal
+            const deletedIds = data.ids || msgId;
+            deletedIds.forEach(id => {
+                const msgEl = chatEl.querySelector(`.msg[data-id="${id}"]`);
+                if (msgEl) msgEl.remove();
+            });
+            
+            // Show toast with actual count
+            if (deletedIds.length < msgId.length) {
+                showToast(`Удалено ${deletedIds.length} из ${msgId.length}`);
+            } else {
+                showToast(`Удалено ${deletedIds.length} сообщений`);
+            }
+            selectedMessageEl = null;
+            document.querySelectorAll('.msg.selected').forEach(el => el.classList.remove('selected'));
+        })
+        .catch(err => {
+            console.error('❌ Ошибка массового удаления:', err);
+            showToast('Не удалось удалить сообщения');
+        });
+        return;
+    }
+
+    // Single delete (existing logic)
+    fetch('/api/message/' + msgId, {
+        method: 'DELETE',
+        headers: {
+            'Authorization': 'Bearer ' + token
+        }
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Ошибка удаления: ' + response.status);
+        }
+        // Remove message from DOM
+        const msgEl = chatEl.querySelector(`.msg[data-id="${msgId}"]`);
+        if (msgEl) {
+            msgEl.remove();
+            showToast('Сообщение удалено');
+        }
+        // Clear selection
+        selectedMessageEl = null;
+    })
+    .catch(err => {
+        console.error('❌ Ошибка удаления:', err);
+        showToast('Не удалось удалить сообщение');
+        selectedMessageEl = null;
+    });
+}
+
+let deleteMessageId = null;
+
+function showDeleteConfirm(msgId) {
+    deleteMessageId = msgId;
+    const modal = document.getElementById('delete-confirm-modal');
+    if (!modal) return;
+
+    modal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
     
-    selectedMessageEl?.classList.remove('selected');
-    hideContextMenu();
+    // Update confirm text for bulk delete
+    const confirmText = document.getElementById('delete-confirm-text');
+    if (confirmText) {
+        if (Array.isArray(msgId)) {
+            confirmText.textContent = `Удалить ${msgId.length} сообщений?`;
+        } else {
+            confirmText.textContent = 'Удалить это сообщение?';
+        }
+    }
+
+    const closeModal = () => {
+        modal.classList.add('hidden');
+        document.body.style.overflow = '';
+        deleteMessageId = null;
+        selectedMessageEl = null;
+        document.querySelectorAll('.msg.selected').forEach(el => el.classList.remove('selected'));
+        document.removeEventListener('keydown', handleKeydown);
+    };
+
+    const handleKeydown = (e) => {
+        if (e.key === 'Escape') {
+            closeModal();
+        }
+    };
+
+    modal.onclick = (e) => {
+        if (e.target === modal) {
+            closeModal();
+        }
+    };
+
+    document.addEventListener('keydown', handleKeydown);
+
+    const confirmBtn = document.getElementById('delete-confirm-btn');
+    const cancelBtn = document.getElementById('delete-cancel-btn');
+
+    if (confirmBtn) {
+        confirmBtn.onclick = () => {
+            if (deleteMessageId) {
+                deleteMessage(deleteMessageId);
+            }
+            closeModal();
+        };
+    }
+
+    if (cancelBtn) {
+        cancelBtn.onclick = closeModal;
+    }
 }
 
 // Get current reply for sending
@@ -1735,6 +2347,30 @@ chatEl?.addEventListener('contextmenu', (e) => {
     showContextMenu(e.clientX, e.clientY, msgEl);
 });
 
+// Выделение сообщения по клику
+chatEl?.addEventListener('click', (e) => {
+    const msgEl = e.target.closest('.msg');
+    if (!msgEl) return;
+
+    // Игнорируем правый клик
+    if (e.button === 2) return;
+
+    if (e.target.closest('.context-menu, .download-btn, .msg-reply, .msg-media, .msg-file, video, audio, img, .msg-forwarded-header')) return;
+
+    if (selectedMessageEl === msgEl) {
+        selectedMessageEl.classList.remove('selected');
+        selectedMessageEl = null;
+        return;
+    }
+
+    if (selectedMessageEl) {
+        selectedMessageEl.classList.remove('selected');
+    }
+
+    msgEl.classList.add('selected');
+    selectedMessageEl = msgEl;
+});
+
 // Делегирование событий на chatEl для longpress (мобильные)
 chatEl?.addEventListener('touchstart', (e) => {
     const touch = e.touches[0];
@@ -1765,16 +2401,22 @@ document.addEventListener('click', (e) => {
     const isContextMenu = contextMenu && contextMenu.contains(e.target);
     const isContextItem = e.target.closest('.context-item');
     const isReplyCancel = e.target.closest('#reply-cancel');
-    
+
     if (contextMenu && !isContextMenu && !isContextItem) {
         hideContextMenu();
     }
-    
+
+    // Не сбрасывать выделение, если клик был внутри контекстного меню
+    if (e.target.closest('.context-menu')) {
+        return;
+    }
+
     // Deselect all messages when clicking outside them
     if (!e.target.closest('.msg') && !isContextItem && !isReplyCancel) {
         chatEl?.querySelectorAll('.msg.selected').forEach(el => {
             el.classList.remove('selected');
         });
+        selectedMessageEl = null;
     }
 });
 

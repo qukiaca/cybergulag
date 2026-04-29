@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Pear2P</title>
+    <title>CyberGulag</title>
     <link rel="stylesheet" href="style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -16,7 +16,7 @@
             <!-- Сайдбар -->
             <aside class="sidebar" id="sidebar">
                 <div class="sidebar-header">
-                    <div class="logo">Pear2P</div>
+                    <div class="logo">КиберГулаг</div>
                     <button id="theme-toggle" class="icon-btn-circle"></button>
                 </div>
                 
@@ -59,6 +59,7 @@
     </header>
 
     <div class="chat-container">
+        <div id="typing-indicator" class="typing-indicator hidden">печатает...</div>
         <div id="chat-messages" class="chat-messages custom-scrollbar"></div>
 
         <div id="drop-overlay" class="drop-overlay hidden">
@@ -116,6 +117,34 @@
             <div class="modal-buttons">
                 <button id="cancel-file-btn" class="btn btn-secondary">Отмена</button>
                 <button id="send-file-btn" class="btn btn-primary">Отправить</button>
+            </div>
+</div>
+</div>
+
+    <!-- Forward modal -->
+    <div id="forward-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h3 style="margin-top:0; text-align:center;">📤 Переслать сообщения</h3>
+            <div id="forward-preview" class="forward-preview"></div>
+            <div class="forward-recipient-container">
+                <label for="forward-recipient">Получатель:</label>
+                <select id="forward-recipient" class="forward-recipient-select"></select>
+            </div>
+            <div class="modal-buttons">
+                <button id="forward-cancel-btn" class="btn btn-secondary">Отмена</button>
+                <button id="forward-send-btn" class="btn btn-primary">Переслать</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete confirm modal -->
+    <div id="delete-confirm-modal" class="modal-overlay hidden">
+        <div class="modal-content">
+            <h3 style="margin-top:0; text-align:center;">⚠️ Удалить сообщение?</h3>
+            <p id="delete-confirm-text" style="text-align:center; color:var(--text-muted); margin:0;">Это действие нельзя отменить</p>
+            <div class="modal-buttons">
+                <button id="delete-cancel-btn" class="btn btn-secondary">Отмена</button>
+                <button id="delete-confirm-btn" class="btn btn-danger">Удалить</button>
             </div>
         </div>
     </div>
