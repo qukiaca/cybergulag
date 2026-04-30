@@ -63,9 +63,11 @@ type Server struct {
 }
 
 var (
-	ipMessageTimestamps = make(map[string][]int64)
-	blockedIPs          = make(map[string]int64)
-	rateLimitMu         sync.Mutex
+	ipMessageTimestamps  = make(map[string][]int64)
+	blockedIPs            = make(map[string]int64)
+	userMessageTimestamps = make(map[string][]int64) // Rate limiting по пользователю
+	blockedUsers          = make(map[string]int64)   // Блокировка пользователей
+	rateLimitMu          sync.Mutex
 )
 
 type TokenData struct {
@@ -1308,6 +1310,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Проверка блокировки пользователя (спам с разных IP)
+	rateLimitMu.Lock()
+	if unblockTime, blocked := blockedUsers[username]; blocked && time.Now().UnixMilli() < unblockTime {
+		rateLimitMu.Unlock()
+		conn, _ := s.upgrader.Upgrade(w, r, nil)
+		if conn != nil {
+			conn.WriteMessage(websocket.TextMessage, []byte("Слишком частые сообщения, попробуйте позже"))
+			conn.Close()
+		}
+		return
+	}
+	rateLimitMu.Unlock()
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("❌ WebSocket upgrade failed: %v (Origin: %s)", err, r.Header.Get("Origin"))
@@ -1476,6 +1491,33 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		msg.From = username
+
+		// Rate limiting по пользователю (защита от спама через VPN/прокси)
+		rateLimitMu.Lock()
+		nowUser := time.Now().UnixMilli()
+
+		// Очистка старых записей (>1 сек)
+		if timestamps, exists := userMessageTimestamps[username]; exists {
+			var recent []int64
+			for _, ts := range timestamps {
+				if nowUser-ts < 1000 {
+					recent = append(recent, ts)
+				}
+			}
+			if len(recent) >= 5 {
+				// Блокировка пользователя на 5 минут
+				blockedUsers[username] = nowUser + 5*60*1000
+				delete(userMessageTimestamps, username)
+				rateLimitMu.Unlock()
+				conn.WriteMessage(websocket.TextMessage, []byte("Слишком частые сообщения, попробуйте позже"))
+				conn.Close()
+				return
+			}
+			userMessageTimestamps[username] = recent
+		}
+
+		userMessageTimestamps[username] = append(userMessageTimestamps[username], nowUser)
+		rateLimitMu.Unlock()
 
 		if msg.Type == "chat" {
 			newID := s.saveMessage(msg)

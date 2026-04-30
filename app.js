@@ -488,6 +488,11 @@ const contactList = document.getElementById("contactList");
 const MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp', 'video/mp4', 'video/webm', 'video/quicktime', 'audio/mpeg', 'audio/mp3', 'audio/ogg', 'audio/wav'];
 const FILE_SIZE_LIMIT = 128 * 1024 * 1024;
 
+// Генерация ключа для черновика в localStorage
+function getDraftKey(user) {
+    return `CyberGulag-draft-${user}`;
+}
+
 const fileBtn = document.getElementById('fileBtn');
 const fileInput = document.getElementById('fileInput');
 const dropOverlay = document.getElementById('drop-overlay');
@@ -530,6 +535,35 @@ function getFileIcon(mimeType) {
     if (mimeType?.startsWith('video/')) return '🎬';
     if (mimeType?.startsWith('audio/')) return '🎵';
     return '📄';
+}
+
+// Сжатие изображений через canvas перед отправкой
+async function compressImage(file, maxWidth = 1920, quality = 0.8) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let w = img.width;
+            let h = img.height;
+            if (w > maxWidth) {
+                h = (h * maxWidth) / w;
+                w = maxWidth;
+            }
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            canvas.toBlob((blob) => {
+                if (blob) {
+                    resolve(blob);
+                } else {
+                    reject(new Error('Canvas toBlob failed'));
+                }
+            }, 'image/jpeg', quality);
+        };
+        img.onerror = () => reject(new Error('Image load failed'));
+        img.src = URL.createObjectURL(file);
+    });
 }
 
 async function handleFiles(files) {
@@ -710,8 +744,25 @@ function showFileConfirmModal(file, targetPeer) {
 
                 console.log('📤 Uploading:', { name: uploadFile.name, size: uploadFile.size, to: toUser });
 
+                // Сжатие изображений перед отправкой
+                let fileToUpload = uploadFile;
+                let fileNameToUpload = uploadFile.name;
+                let mimeTypeToUpload = uploadFile.type;
+                if (uploadFile.type.startsWith('image/')) {
+                    try {
+                        const compressed = await compressImage(uploadFile);
+                        fileToUpload = compressed;
+                        const baseName = uploadFile.name.replace(/\.[^.]+$/, '');
+                        fileNameToUpload = baseName + '.jpg';
+                        mimeTypeToUpload = 'image/jpeg';
+                        console.log('🗜️ Image compressed:', uploadFile.size, '->', compressed.size);
+                    } catch (err) {
+                        console.warn('⚠️ Compression failed, using original:', err);
+                    }
+                }
+
                 const formData = new FormData();
-                formData.append('file', uploadFile);
+                formData.append('file', fileToUpload);
                 formData.append('to_user', toUser);
 
                 const session = getSession();
@@ -1020,9 +1071,9 @@ async function startRecording() {
         // Параметры MediaRecorder со сжатием для видео
         const recorderOptions = {};
         if (mediaMode === 'video') {
-            // VP8 codec, 256 Kbps — компромисс между качеством и размером
+            // VP8 codec, 128 Kbps — баланс качество/вес
             recorderOptions.mimeType = 'video/webm;codecs=vp8';
-            recorderOptions.videoBitsPerSecond = 256000;
+            recorderOptions.videoBitsPerSecond = 128000;
         }
         
         mediaRecorder = new MediaRecorder(localStream, recorderOptions);
@@ -1099,6 +1150,13 @@ function showToast(message) {
 
 function sendMedia() {
     const blob = new Blob(chunks, { type: mediaMode === 'voice' ? 'audio/ogg' : 'video/webm' });
+    
+    // Проверка размера видео: если > 50 МБ — предупреждение и отмена
+    if (mediaMode === 'video' && blob.size > 50 * 1024 * 1024) {
+        showToast("Видео слишком большое, попробуйте короче");
+        console.warn(`⚠️ Video blob ${(blob.size / 1024 / 1024).toFixed(1)} MB exceeds 50 MB limit`);
+        return;
+    }
     
     // Проверка размера: если blob > MEDIA_SIZE_LIMIT_KB — предупреждение
     const SIZE_LIMIT = MEDIA_SIZE_LIMIT_KB * 1024;
@@ -1212,6 +1270,17 @@ function renderContactList() {
             // Сбрасываем targetPeer перед установкой нового
             targetPeer = null;
             targetPeer = id;
+            
+            // Восстановление черновика для выбранного контакта
+            const draftKey = getDraftKey(id);
+            const savedDraft = localStorage.getItem(draftKey);
+            if (savedDraft && !msgInput.value) {
+                msgInput.value = savedDraft;
+                autoResizeTextarea();
+                // Перемещаем курсор в конец
+                msgInput.selectionStart = msgInput.selectionEnd = msgInput.value.length;
+                msgInput.focus();
+            }
             
             // Скрываем typing indicator при смене диалога
             hideTypingIndicator();
@@ -1618,6 +1687,10 @@ const sendMessage = () => {
     
     hideReplyPreview();
     msgInput.value = '';
+    // Удаляем черновик после отправки сообщения
+    if (targetPeer) {
+        localStorage.removeItem(getDraftKey(targetPeer));
+    }
     msgInput.style.height = 'auto';
     msgInput.dispatchEvent(new Event("input"));
 };
@@ -1629,8 +1702,25 @@ function autoResizeTextarea() {
 }
 
 // Add event listeners for sending messages
+let draftSaveTimeout = null;
+const DRAFT_SAVE_DELAY = 300;
+const DRAFT_MAX_LENGTH = 2000;
+
 msgInput.addEventListener('input', () => {
     autoResizeTextarea();
+    
+    // Автосохранение черновика с debounce 300мс
+    if (draftSaveTimeout) clearTimeout(draftSaveTimeout);
+    draftSaveTimeout = setTimeout(() => {
+        if (!targetPeer) return;
+        const draftKey = getDraftKey(targetPeer);
+        const text = msgInput.value.trim();
+        if (text) {
+            localStorage.setItem(draftKey, text.substring(0, DRAFT_MAX_LENGTH));
+        } else {
+            localStorage.removeItem(draftKey);
+        }
+    }, DRAFT_SAVE_DELAY);
 });
 
 // Typing Indicator: отправка события "typing" с debounce 1.5 сек
@@ -2425,5 +2515,15 @@ contextMenu?.addEventListener('click', (e) => {
     const item = e.target.closest('.context-item');
     if (item) {
         handleContextAction(item.dataset.action);
+    }
+});
+
+// Fallback: синхронное сохранение черновика перед закрытием/обновлением страницы
+window.addEventListener('beforeunload', () => {
+    if (!targetPeer) return;
+    const text = msgInput.value.trim();
+    const draftKey = getDraftKey(targetPeer);
+    if (text) {
+        localStorage.setItem(draftKey, text.substring(0, DRAFT_MAX_LENGTH));
     }
 });
